@@ -1348,22 +1348,34 @@ async function onlineRequest(path, options){
 }
 const Store = {
   async get(key, shared){
-    if (ONLINE_API_BASE) { const r = await onlineRequest('/storage/'+(shared?'shared':'personal')+'/'+encodeURIComponent(key)); return r.value===null ? null : JSON.stringify(r.value); }
+    if (ONLINE_API_BASE) {
+      try{ const r = await onlineRequest('/storage/'+(shared?'shared':'personal')+'/'+encodeURIComponent(key)); return (r.value===null || r.value===undefined) ? null : r.value; }
+      catch(e){ console.warn('online storage get failed', e); return null; }
+    }
     try{ const r = await window.storage.get(key, !!shared); return r ? r.value : null; }
     catch(e){ return null; }
   },
   async set(key, value, shared){
-    if (ONLINE_API_BASE) { await onlineRequest('/storage/'+(shared?'shared':'personal')+'/'+encodeURIComponent(key), {method:'PUT', body:JSON.stringify({value:JSON.parse(value)})}); return {ok:true}; }
+    if (ONLINE_API_BASE) {
+      try{ await onlineRequest('/storage/'+(shared?'shared':'personal')+'/'+encodeURIComponent(key), {method:'PUT', body:JSON.stringify({value})}); return {ok:true}; }
+      catch(e){ console.warn('online storage set failed', e); return null; }
+    }
     try{ return await window.storage.set(key, value, !!shared); }
     catch(e){ console.warn('storage set failed', e); return null; }
   },
   async del(key, shared){
-    if (ONLINE_API_BASE) { await onlineRequest('/storage/'+(shared?'shared':'personal')+'/'+encodeURIComponent(key), {method:'DELETE'}); return {ok:true}; }
+    if (ONLINE_API_BASE) {
+      try{ await onlineRequest('/storage/'+(shared?'shared':'personal')+'/'+encodeURIComponent(key), {method:'DELETE'}); return {ok:true}; }
+      catch(e){ console.warn('online storage delete failed', e); return null; }
+    }
     try{ return await window.storage.delete(key, !!shared); }
     catch(e){ return null; }
   },
   async list(prefix, shared){
-    if (ONLINE_API_BASE) { const r = await onlineRequest('/storage/'+(shared?'shared':'personal')+'?prefix='+encodeURIComponent(prefix || '')); return r.keys || []; }
+    if (ONLINE_API_BASE) {
+      try{ const r = await onlineRequest('/storage/'+(shared?'shared':'personal')+'?prefix='+encodeURIComponent(prefix || '')); return r.keys || []; }
+      catch(e){ console.warn('online storage list failed', e); return []; }
+    }
     try{ const r = await window.storage.list(prefix, !!shared); return r ? r.keys : []; }
     catch(e){ return []; }
   }
@@ -1803,7 +1815,7 @@ function closeLivePanel(){ document.getElementById('live-panel').classList.remov
 function startLiveSync(){
   refreshLive(); clearInterval(LIVE_STATE.pollHandle); clearInterval(LIVE_STATE.presenceHandle); LIVE_STATE.pollHandle=setInterval(refreshLive,5000);
   LIVE_STATE.presenceHandle=setInterval(()=>{ const entity=STATE.selectedId?ENTITIES[STATE.selectedId]:null; updateAgentPresence(entity,true); },45000);
-  if (ONLINE_API_BASE && typeof EventSource!=='undefined'){ LIVE_STATE.eventSource=new EventSource(ONLINE_API_BASE+'/live/stream'); LIVE_STATE.eventSource.onmessage=()=>refreshLive(); }
+  if (ONLINE_API_BASE && typeof EventSource!=='undefined'){ LIVE_STATE.eventSource=new EventSource(ONLINE_API_BASE+'/live/stream', {withCredentials:true}); LIVE_STATE.eventSource.onmessage=()=>refreshLive(); }
 }
 
 function canUserViewNews(item){
@@ -4125,7 +4137,9 @@ function renderAccountEditForm(account){
     '<div class="admin-form-body">'+
       '<div class="admin-field"><label>NOME EXIBIDO</label><input id="acc-displayname" type="text" value="'+(account?account.displayName:'').replace(/"/g,'&quot;')+'"></div>'+
       '<div class="admin-field"><label>USUÁRIO (LOGIN)</label><input id="acc-username" type="text" '+(isNew?'':'disabled')+' value="'+(account?account.username:'')+'"></div>'+
+      (isNew ? '<div class="admin-hint">Usuário: só letras minúsculas, números, ponto, traço ou underline (3 a 49 caracteres).</div>' : '')+
       '<div class="admin-field"><label>'+(isNew?'SENHA':'NOVA SENHA (deixe em branco para manter)')+'</label><input id="acc-password" type="password" placeholder="'+(isNew?'defina uma senha':'••••••••')+'" autocomplete="new-password"></div>'+ 
+      (isNew ? '<div class="admin-hint">Senha: pelo menos 10 caracteres.</div>' : '')+
       (isNew ? '' : '<div class="admin-hint">Papel: <strong style="color:var(--phosphor)">'+(account.role==='admin'?'ADMINISTRADOR (privilégios fixos)':'AGENTE')+'</strong></div>')+
       (account && account.username===DEFAULT_ADMIN_USERNAME ? '' :
         '<div class="admin-checkbox-row"><input type="checkbox" id="acc-all-regions" '+(perms.allRegions?'checked':'')+'> ACESSO TOTAL AO MAPA</div>'+
@@ -4147,6 +4161,8 @@ function renderAccountEditForm(account){
     const password = document.getElementById('acc-password').value;
     if (!displayName || !username){ alert('Nome exibido e usuário são obrigatórios.'); return; }
     if (isNew && !password){ alert('Defina uma senha para a nova conta.'); return; }
+    if (isNew && !/^[a-z0-9][a-z0-9._-]{2,48}$/.test(username)){ alert('Usuário inválido: use só letras minúsculas, números, ponto, traço ou underline (3 a 49 caracteres, começando com letra ou número).'); return; }
+    if (isNew && password.length < 10){ alert('A senha precisa ter pelo menos 10 caracteres.'); return; }
     if (isNew){
       const existing = await findAccount(username);
       if (existing){ alert('Já existe uma conta com esse usuário.'); return; }
@@ -4187,7 +4203,13 @@ function renderAccountEditForm(account){
       createdBy: STATE.agentName
     };
     finalAccount.password = isNew || password ? password : undefined;
-    await saveAccount(finalAccount);
+    try{
+      await saveAccount(finalAccount);
+    }catch(err){
+      console.warn('saveAccount failed', err);
+      alert('Não foi possível salvar a conta. '+(err && err.message ? err.message : 'Tente novamente.'));
+      return;
+    }
     showDiscoveryToast(isNew?'CONTA CRIADA':'CONTA ATUALIZADA', displayName);
     openAccountsPanel();
   });

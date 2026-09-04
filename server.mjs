@@ -145,12 +145,12 @@ app.post('/api/auth/login', ah(async (req, res) => {
   }
   loginAttempts.delete(username);
   const token = await issueSession(username);
-  res.setHeader('Set-Cookie', `karsk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${secureCookies ? '; Secure' : ''}`);
+  res.setHeader('Set-Cookie', `karsk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=${secureCookies ? 'None' : 'Lax'}; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${secureCookies ? '; Secure' : ''}`);
   res.json({ token, user: publicUser(row) });
 }));
 app.post('/api/auth/logout', auth, ah(async (req, res) => {
   await run('DELETE FROM sessions WHERE token_hash=?', [tokenHash(req.token)]);
-  res.setHeader('Set-Cookie', 'karsk_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+  res.setHeader('Set-Cookie', `karsk_session=; HttpOnly; SameSite=${secureCookies ? 'None' : 'Lax'}; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}`);
   res.json({ ok: true });
 }));
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
