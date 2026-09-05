@@ -2155,7 +2155,7 @@ function interruptFlight(){
 }
 
 /* ---- pan (drag) — dampened for a heavier, more deliberate strategic-map feel ---- */
-const PAN_DAMPING = 0.11;
+const PAN_DAMPING = 0.055;
 function screenDeltaToWorldPct(dxScreen, dyScreen){
   // convert screen-space pixel delta to world-percent delta, accounting for zoom
   const rect = cameraViewportEl.getBoundingClientRect();
@@ -3546,7 +3546,7 @@ function setupMapInteractions(){
   let isDown = false, lastX=0, lastY=0, movedFar=false;
   let lastMoveT=0, velX=0, velY=0;
   let dragTargetX=0, dragTargetY=0, dragEaseHandle=null;
-  const DRAG_EASE = 0.24; // higher = snappier follow, lower = more lag/fluidity
+  const DRAG_EASE = 0.16; // higher = snappier follow, lower = more lag/fluidity
 
   function dragEaseStep(){
     const dxRemain = dragTargetX - STATE.camera.x, dyRemain = dragTargetY - STATE.camera.y;
@@ -3583,8 +3583,8 @@ function setupMapInteractions(){
     const now = performance.now();
     const dt = Math.max(8, now-lastMoveT); lastMoveT = now;
     // exponential smoothing of velocity so a single jittery frame doesn't dominate the glide
-    velX = Math.max(-0.045, Math.min(0.045, velX*0.72 + (delta.dx*100 * (16/dt))*0.18));
-    velY = Math.max(-0.045, Math.min(0.045, velY*0.72 + (delta.dy*100 * (16/dt))*0.18));
+    velX = Math.max(-0.028, Math.min(0.028, velX*0.72 + (delta.dx*100 * (16/dt))*0.18));
+    velY = Math.max(-0.028, Math.min(0.028, velY*0.72 + (delta.dy*100 * (16/dt))*0.18));
     dragTargetX += delta.dx*100;
     dragTargetY += delta.dy*100;
     ensureDragEaseRunning();
