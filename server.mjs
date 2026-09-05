@@ -61,7 +61,25 @@ async function setupSchema() {
       id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, timestamp TEXT NOT NULL,
       created_by TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS agent_files (
+      id TEXT PRIMARY KEY, owner TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'nota',
+      classification TEXT NOT NULL DEFAULT 'PESSOAL', folder TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', data_url TEXT,
+      shared_with_agents INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      FOREIGN KEY(owner) REFERENCES users(username) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id TEXT PRIMARY KEY, username TEXT NOT NULL, action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
+    );
   `);
+}
+const FILE_TYPES = new Set(['nota','imagem','documento','evidencia']);
+const CLASSIFICATIONS = new Set(['PESSOAL','CONFIDENCIAL','EVIDENCIA','COMPARTILHADO']);
+function publicAgentFile(row){ return { id: row.id, owner: row.owner, type: row.type, classification: row.classification, folder: row.folder, title: row.title, content: row.content, dataUrl: row.data_url, sharedWithAgents: !!row.shared_with_agents, createdAt: row.created_at, updatedAt: row.updated_at }; }
+async function logAudit(username, action, detail){
+  try{ await run('INSERT INTO audit_log VALUES (?, ?, ?, ?, ?)', ['aud-'+crypto.randomBytes(8).toString('hex'), username, action, detail ? String(detail).slice(0,500) : null, new Date().toISOString()]); }
+  catch(e){ console.warn('audit log write failed', e); }
 }
 
 const liveClients = new Set();
@@ -146,11 +164,13 @@ app.post('/api/auth/login', ah(async (req, res) => {
   loginAttempts.delete(username);
   const token = await issueSession(username);
   res.setHeader('Set-Cookie', `karsk_session=${encodeURIComponent(token)}; HttpOnly; SameSite=${secureCookies ? 'None' : 'Lax'}; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${secureCookies ? '; Secure' : ''}`);
+  await logAudit(username, 'login', null);
   res.json({ token, user: publicUser(row) });
 }));
 app.post('/api/auth/logout', auth, ah(async (req, res) => {
   await run('DELETE FROM sessions WHERE token_hash=?', [tokenHash(req.token)]);
   res.setHeader('Set-Cookie', `karsk_session=; HttpOnly; SameSite=${secureCookies ? 'None' : 'Lax'}; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}`);
+  await logAudit(req.user.username, 'logout', null);
   res.json({ ok: true });
 }));
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
@@ -239,6 +259,87 @@ app.delete('/api/users/:username', auth, admin, ah(async (req, res) => {
   if (username === req.user.username) return res.status(400).json({ error: 'CANNOT_DELETE_SELF' });
   await run('DELETE FROM users WHERE username=?', [username]);
   res.json({ ok: true });
+}));
+
+function canSeeFile(requester, row){
+  if (requester.username === row.owner) return true;
+  if (requester.role === 'admin') return row.classification !== 'PESSOAL';
+  return row.classification === 'COMPARTILHADO' && !!row.shared_with_agents;
+}
+app.get('/api/files/shared-feed', auth, ah(async (req, res) => {
+  const rows = await all("SELECT * FROM agent_files WHERE classification='COMPARTILHADO' AND shared_with_agents=1 AND owner!=? ORDER BY updated_at DESC LIMIT 100", [req.user.username]);
+  res.json({ files: rows.map(publicAgentFile) });
+}));
+app.get('/api/files', auth, ah(async (req, res) => {
+  const owner = String(req.query.owner || req.user.username).toLowerCase();
+  const rows = await all('SELECT * FROM agent_files WHERE owner=? ORDER BY updated_at DESC', [owner]);
+  res.json({ files: rows.filter(row => canSeeFile(req.user, row)).map(publicAgentFile) });
+}));
+app.post('/api/files', auth, ah(async (req, res) => {
+  const type = FILE_TYPES.has(req.body.type) ? req.body.type : 'nota';
+  const classification = CLASSIFICATIONS.has(req.body.classification) ? req.body.classification : 'PESSOAL';
+  const now = new Date().toISOString();
+  const row = {
+    id: 'file-'+crypto.randomBytes(8).toString('hex'), owner: req.user.username, type, classification,
+    folder: String(req.body.folder||'').slice(0,120), title: String(req.body.title||'SEM TÍTULO').slice(0,200),
+    content: String(req.body.content||'').slice(0,50000),
+    data_url: req.body.dataUrl ? String(req.body.dataUrl).slice(0,6*1024*1024) : null,
+    shared_with_agents: (classification==='COMPARTILHADO' && req.body.sharedWithAgents) ? 1 : 0,
+    created_at: now, updated_at: now
+  };
+  await run('INSERT INTO agent_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(row));
+  await logAudit(req.user.username, 'criar_arquivo', type+':'+row.title);
+  res.status(201).json({ file: publicAgentFile(row) });
+}));
+app.put('/api/files/:id', auth, ah(async (req, res) => {
+  const existing = await get('SELECT * FROM agent_files WHERE id=?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'FILE_NOT_FOUND' });
+  if (existing.owner !== req.user.username && req.user.role !== 'admin') return res.status(403).json({ error: 'FORBIDDEN' });
+  const classification = CLASSIFICATIONS.has(req.body.classification) ? req.body.classification : existing.classification;
+  const title = req.body.title!=null ? String(req.body.title).slice(0,200) : existing.title;
+  const content = req.body.content!=null ? String(req.body.content).slice(0,50000) : existing.content;
+  const folder = req.body.folder!=null ? String(req.body.folder).slice(0,120) : existing.folder;
+  const sharedWithAgents = classification==='COMPARTILHADO' ? (req.body.sharedWithAgents!=null ? (req.body.sharedWithAgents?1:0) : existing.shared_with_agents) : 0;
+  const dataUrl = req.body.dataUrl!==undefined ? (req.body.dataUrl ? String(req.body.dataUrl).slice(0,6*1024*1024) : null) : existing.data_url;
+  await run('UPDATE agent_files SET title=?, content=?, folder=?, classification=?, shared_with_agents=?, data_url=?, updated_at=? WHERE id=?', [title, content, folder, classification, sharedWithAgents, dataUrl, new Date().toISOString(), req.params.id]);
+  await logAudit(req.user.username, 'editar_arquivo', existing.type+':'+title);
+  res.json({ file: publicAgentFile(await get('SELECT * FROM agent_files WHERE id=?', [req.params.id])) });
+}));
+app.delete('/api/files/:id', auth, ah(async (req, res) => {
+  const existing = await get('SELECT * FROM agent_files WHERE id=?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'FILE_NOT_FOUND' });
+  if (existing.owner !== req.user.username && req.user.role !== 'admin') return res.status(403).json({ error: 'FORBIDDEN' });
+  await run('DELETE FROM agent_files WHERE id=?', [req.params.id]);
+  await logAudit(req.user.username, 'excluir_arquivo', existing.type+':'+existing.title);
+  res.json({ ok: true });
+}));
+
+app.post('/api/audit', auth, ah(async (req, res) => {
+  await logAudit(req.user.username, String(req.body.action||'acao').slice(0,80), req.body.detail);
+  res.json({ ok: true });
+}));
+app.get('/api/audit', auth, admin, ah(async (req, res) => {
+  const username = req.query.username ? String(req.query.username).toLowerCase() : null;
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit)||200));
+  const rows = username
+    ? await all('SELECT * FROM audit_log WHERE username=? ORDER BY created_at DESC LIMIT ?', [username, limit])
+    : await all('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?', [limit]);
+  res.json({ entries: rows });
+}));
+
+app.get('/api/admin/backup', auth, admin, ah(async (req, res) => {
+  const records = await all('SELECT record_key, value_json, updated_at FROM records WHERE scope=?', ['shared']);
+  const users = (await all('SELECT username, display_name, role, permissions_json, created_at FROM users')).map(u => ({ username: u.username, displayName: u.display_name, role: u.role, permissions: JSON.parse(u.permissions_json), createdAt: u.created_at }));
+  const agentFiles = (await all('SELECT * FROM agent_files')).map(publicAgentFile);
+  const auditLog = await all('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 2000');
+  const events = await all('SELECT * FROM live_events');
+  const transmissions = await all('SELECT * FROM live_transmissions');
+  const states = await all('SELECT * FROM city_states');
+  res.json({
+    exportedAt: new Date().toISOString(), version: 2, service: 'karsk-backend',
+    shared: records.map(r => ({ key: r.record_key, value: JSON.parse(r.value_json), updatedAt: r.updated_at })),
+    users, agentFiles, auditLog, events, transmissions, states
+  });
 }));
 
 app.get('/api/storage/:scope/:key', auth, ah(async (req, res) => {

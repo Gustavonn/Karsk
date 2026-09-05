@@ -778,6 +778,28 @@ body.crt-high #crt-flicker{animation:crt-flicker-anim 6s infinite;}
 .live-admin-actions{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;}.live-admin-actions button{background:var(--petrol);border:1px solid var(--petrol-bright);color:var(--parchment);padding:7px 9px;font-family:var(--font-mono);font-size:9px;}
 .live-del-btn{margin-top:6px;background:rgba(140,40,30,.25);border:1px solid rgba(200,80,60,.6);color:#e8b8ab;padding:3px 7px;font-family:var(--font-mono);font-size:8px;letter-spacing:.05em;cursor:pointer;}
 .live-del-btn:hover{background:rgba(180,50,35,.4);}
+.live-badge{display:inline-block;margin-left:5px;background:var(--danger,#b23c2f);color:#fff;border-radius:8px;padding:0 5px;font-size:9px;line-height:15px;min-width:15px;text-align:center;}
+.live-badge.hidden{display:none;}
+.locker-toolbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;}
+.locker-toolbar input, .locker-toolbar select{flex:1 1 120px;background:rgba(0,0,0,.3);border:1px solid var(--petrol-bright);color:var(--parchment);padding:6px 8px;font-family:var(--font-mono);font-size:10px;}
+.locker-list{display:flex;flex-direction:column;gap:8px;}
+.locker-row{border:1px solid var(--petrol-bright);padding:10px 12px;background:rgba(255,255,255,.02);}
+.locker-row-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}
+.locker-row-title{font-weight:600;color:var(--parchment);}
+.locker-row-meta{font-family:var(--font-mono);font-size:9px;color:var(--parchment-faint);margin-top:2px;}
+.locker-row-body{margin-top:6px;font-size:12px;color:var(--parchment-faint);white-space:pre-wrap;}
+.locker-row-img{max-width:100%;max-height:160px;margin-top:6px;border:1px solid var(--petrol-bright);}
+.class-badge{display:inline-block;padding:1px 6px;font-family:var(--font-mono);font-size:8px;letter-spacing:.05em;border:1px solid;border-radius:2px;}
+.class-badge.PESSOAL{color:#9fb8c8;border-color:#4c6473;}
+.class-badge.CONFIDENCIAL{color:#e0b45a;border-color:#8a6c2a;}
+.class-badge.EVIDENCIA{color:#e0895a;border-color:#8a4c2a;}
+.class-badge.COMPARTILHADO{color:#8fd48f;border-color:#3f6b3f;}
+.locker-row-actions{display:flex;gap:6px;flex-shrink:0;}
+.locker-row-actions button{background:var(--petrol);border:1px solid var(--petrol-bright);color:var(--parchment);padding:3px 8px;font-family:var(--font-mono);font-size:8px;cursor:pointer;}
+.agentfiles-list-item{padding:8px 10px;border-bottom:1px solid var(--petrol-bright);cursor:pointer;display:flex;justify-content:space-between;}
+.agentfiles-list-item:hover{background:rgba(255,255,255,.04);}
+.audit-row{padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06);font-family:var(--font-mono);font-size:10px;color:var(--parchment-faint);}
+.audit-row strong{color:var(--parchment);}
 @media (max-width:760px){#map-3d-toolbar{top:64px;left:12px;}#map-3d-status{left:12px;bottom:92px;}}
 
 /* boot / access-denied stamp */
@@ -1020,7 +1042,8 @@ body.crt-high #crt-flicker{animation:crt-flicker-anim 6s infinite;}
           <button class="hud-btn" id="btn-archive" title="Mission Archive">MISSION ARCHIVE</button>
           <button class="hud-btn" id="btn-terminal" title="Terminal (T)">TERMINAL</button>
           <button class="hud-btn" id="btn-map3d" title="Abrir mapa tático 3D">MAPA 3D</button>
-          <button class="hud-btn" id="btn-live" title="Agentes, rádio e eventos em tempo real">LIVE</button>
+          <button class="hud-btn" id="btn-live" title="Agentes, rádio e eventos em tempo real">LIVE<span id="live-badge" class="live-badge hidden">0</span></button>
+          <button class="hud-btn" id="btn-locker" title="Seu arquivo pessoal">ARQUIVO PESSOAL</button>
           <button class="hud-btn" id="btn-search" title="Buscar (Ctrl+K)">BUSCAR</button>
           <button class="hud-btn" id="btn-audio" title="Controles de áudio">ÁUDIO</button>
           <button class="hud-btn" id="btn-crt" title="Ciclar efeito CRT">CRT: LOW</button>
@@ -1045,6 +1068,9 @@ body.crt-high #crt-flicker{animation:crt-flicker-anim 6s infinite;}
       <button class="tool-btn" data-tool="blocks" title="Configurar geração de blocos urbanos">BLOCOS</button>
       <button class="tool-btn" data-tool="mapbg" title="Enviar uma nova imagem de mapa base (compartilhada com todos os agentes)">MAPA</button>
       <button class="tool-btn" data-tool="mapreset" title="Restaurar o mapa base original">ORIGINAL</button>
+      <button class="tool-btn" data-tool="agentfiles" title="Ver conteúdo pessoal dos agentes">CONTEÚDO DOS AGENTES</button>
+      <button class="tool-btn" data-tool="auditlog" title="Histórico de ações dos usuários">AUDIT LOG</button>
+      <button class="tool-btn" data-tool="backup" title="Baixar backup completo dos dados">BAIXAR BACKUP</button>
       <button class="tool-btn" data-tool="cancel">CANCEL</button>
     </div>
     <input type="file" id="map-upload-input" accept="image/*" class="hidden">
@@ -1744,7 +1770,9 @@ async function loadLiveLocal(){
 }
 async function saveLiveLocal(type){ await Store.set(LIVE_KEYS[type],JSON.stringify(LIVE_STATE[type]),true); }
 const SEEN_LIVE_STORE_KEY = 'karsk:seen-live';
+const UNREAD_LIVE_STORE_KEY = 'karsk:unread-live';
 let SEEN_LIVE_IDS = new Set();
+let UNREAD_LIVE_IDS = new Set();
 let seenLiveLoaded = false;
 let seenLiveIsFreshBootstrap = false;
 async function ensureSeenLiveLoaded(){
@@ -1753,8 +1781,30 @@ async function ensureSeenLiveLoaded(){
   const raw = await Store.get(SEEN_LIVE_STORE_KEY, false);
   if (raw){ try{ SEEN_LIVE_IDS = new Set(JSON.parse(raw)); }catch(e){ SEEN_LIVE_IDS = new Set(); } }
   else { seenLiveIsFreshBootstrap = true; }
+  const rawUnread = await Store.get(UNREAD_LIVE_STORE_KEY, false);
+  if (rawUnread){ try{ UNREAD_LIVE_IDS = new Set(JSON.parse(rawUnread)); }catch(e){ UNREAD_LIVE_IDS = new Set(); } }
 }
 function persistSeenLiveIds(){ Store.set(SEEN_LIVE_STORE_KEY, JSON.stringify(Array.from(SEEN_LIVE_IDS).slice(-400)), false); }
+function persistUnreadLiveIds(){ Store.set(UNREAD_LIVE_STORE_KEY, JSON.stringify(Array.from(UNREAD_LIVE_IDS).slice(-200)), false); }
+function updateLiveBadge(){
+  const badge = document.getElementById('live-badge');
+  if (!badge) return;
+  const n = UNREAD_LIVE_IDS.size;
+  badge.textContent = n>99 ? '99+' : String(n);
+  badge.classList.toggle('hidden', n===0);
+}
+function clearUnreadLive(){ UNREAD_LIVE_IDS.clear(); persistUnreadLiveIds(); updateLiveBadge(); }
+let SHARED_FILES_SEEN = new Set();
+async function pollSharedFilesFeed(){
+  if (!ONLINE_API_BASE) return [];
+  try{
+    const r = await onlineRequest('/files/shared-feed');
+    const items = r.files || [];
+    const fresh = [];
+    items.forEach(f=>{ const key='file:'+f.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); fresh.push({kind:'file', item:f}); } });
+    return fresh;
+  }catch(e){ return []; }
+}
 async function refreshLive(){
   if (ONLINE_API_BASE){ try{ const data=await onlineRequest('/live/snapshot'); Object.assign(LIVE_STATE,{presence:data.presence||[],events:data.events||[],transmissions:data.transmissions||[],states:data.states||[]}); LIVE_STATE.activeState=LIVE_STATE.states.find(state=>state.active)||LIVE_STATE.states[0]||null; }catch(e){} }
   else await loadLiveLocal();
@@ -1762,17 +1812,24 @@ async function refreshLive(){
   const freshlyNew = [];
   LIVE_STATE.events.forEach(event=>{ const key='evt:'+event.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'event', item:event}); } });
   LIVE_STATE.transmissions.forEach(tx=>{ const key='tx:'+tx.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'transmission', item:tx}); } });
+  freshlyNew.push(...await pollSharedFilesFeed());
   renderLivePanel(); renderMarkers(); updateLiveHud();
   if (freshlyNew.length){
     persistSeenLiveIds();
+    freshlyNew.forEach(entry=> UNREAD_LIVE_IDS.add(entry.kind+':'+entry.item.id));
+    persistUnreadLiveIds();
+    updateLiveBadge();
     if (!seenLiveIsFreshBootstrap){
       playAudio('live_alert');
       const first = freshlyNew[0];
-      const isEvent = first.kind==='event';
-      const heading = isEvent ? (['HIGH','CRITICAL'].includes(first.item.severity) ? '[ AVISO IMPORTANTE ]' : '[ NOVO EVENTO ]') : '[ RÁDIO L.O.B. ]';
-      const label = freshlyNew.length>1 ? freshlyNew.length+' novos registros disponíveis' : (isEvent ? (first.item.title||'Novo evento disponível.') : (first.item.body||first.item.sender||'Nova transmissão disponível.'));
+      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]'};
+      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"'};
+      const heading = headingFor[first.kind];
+      const label = freshlyNew.length>1 ? freshlyNew.length+' novos registros disponíveis' : labelFor[first.kind];
       showDiscoveryToast(heading, label);
     }
+  } else {
+    updateLiveBadge();
   }
   seenLiveIsFreshBootstrap = false;
 }
@@ -1841,6 +1898,7 @@ async function createLiveRecord(kind){
   } else if (kind==='radio'){
     const transmission={id:'tx-'+Date.now().toString(36),sender:STATE.agentId,channel:'CENTRAL',body:prompt('Mensagem')||'',type:'CENTRAL',scope:'GLOBAL',interference:'CLEAR',urgent:true,createdAt:liveNow()};
     if (ONLINE_API_BASE) await onlineRequest('/live/transmissions',{method:'POST',body:JSON.stringify(transmission)}); else { LIVE_STATE.transmissions.unshift(transmission); await saveLiveLocal('transmissions'); }
+    logClientAudit('enviar_mensagem', transmission.body.slice(0,80));
   } else {
     const state={id:'state-'+Date.now().toString(36),name:title,description:prompt('Descrição')||'',timestamp:liveNow(),active:1,createdAt:liveNow()};
     if (ONLINE_API_BASE) await onlineRequest('/live/states',{method:'POST',body:JSON.stringify(state)}); else { LIVE_STATE.states.forEach(item=>item.active=0); LIVE_STATE.states.unshift(state); LIVE_STATE.activeState=state; await saveLiveLocal('states'); }
@@ -1860,7 +1918,7 @@ async function updateAgentPresence(entity, online){
   else { const index=LIVE_STATE.presence.findIndex(item=>item.agentId===STATE.agentId); const row=Object.assign({agentId:STATE.agentId,userId:STATE.agentId,lastSeen:Date.now()},presence); if(index<0)LIVE_STATE.presence.push(row);else LIVE_STATE.presence[index]=row; await saveLiveLocal('presence'); }
   refreshLive();
 }
-function openLivePanel(){ document.getElementById('live-panel').classList.add('open'); refreshLive(); playAudio('panel'); }
+function openLivePanel(){ document.getElementById('live-panel').classList.add('open'); refreshLive().then(clearUnreadLive); playAudio('panel'); }
 function closeLivePanel(){ document.getElementById('live-panel').classList.remove('open'); playAudio('close'); }
 function startLiveSync(){
   refreshLive(); clearInterval(LIVE_STATE.pollHandle); clearInterval(LIVE_STATE.presenceHandle); LIVE_STATE.pollHandle=setInterval(refreshLive,5000);
@@ -3287,6 +3345,7 @@ function openDossier(id){
   if (!entity) return;
   STATE.selectedId = id;
   playAudio('document');
+  logClientAudit('visualizar_'+(entity.kind==='city'||entity.kind==='district'||entity.kind==='custom-region'?'regiao':'local'), entity.name||id);
   dossierEl.innerHTML = buildDossierHTML(entity);
   dossierEl.classList.add('open');
   const closeBtn = document.getElementById('dossier-close-btn');
@@ -4803,6 +4862,208 @@ function openMissionArchivePanel(){
 
 let worldTickHandle = null;
 let autosaveHandle = null;
+
+/* ============================================================================
+   ARQUIVO PESSOAL DOS AGENTES — classificação (PESSOAL/CONFIDENCIAL/EVIDÊNCIA/
+   COMPARTILHADO), pastas, busca/filtro/ordenação. Visibilidade é decidida pelo
+   backend (canSeeFile) — o cliente só espelha o que a API já filtrou.
+   ============================================================================ */
+const FILE_TYPE_LABEL = {nota:'ANOTAÇÃO', imagem:'IMAGEM', documento:'DOCUMENTO', evidencia:'EVIDÊNCIA'};
+const CLASS_LABEL = {PESSOAL:'PESSOAL', CONFIDENCIAL:'CONFIDENCIAL', EVIDENCIA:'EVIDÊNCIA', COMPARTILHADO:'COMPARTILHADO COM L.O.B.'};
+
+async function logClientAudit(action, detail){
+  if (!ONLINE_API_BASE) return;
+  try{ await onlineRequest('/audit', {method:'POST', body:JSON.stringify({action, detail})}); }catch(e){}
+}
+async function apiFilesList(owner){
+  if (!ONLINE_API_BASE) return null;
+  try{ const r = await onlineRequest('/files?owner='+encodeURIComponent(owner)); return r.files||[]; }
+  catch(e){ return []; }
+}
+async function apiFileCreate(payload){
+  const r = await onlineRequest('/files', {method:'POST', body:JSON.stringify(payload)});
+  return r.file;
+}
+async function apiFileUpdate(id, payload){
+  const r = await onlineRequest('/files/'+encodeURIComponent(id), {method:'PUT', body:JSON.stringify(payload)});
+  return r.file;
+}
+async function apiFileDelete(id){
+  await onlineRequest('/files/'+encodeURIComponent(id), {method:'DELETE'});
+}
+
+let LOCKER_STATE = { files: [], search:'', classFilter:'ALL', folderFilter:'ALL', sort:'newest' };
+
+async function openLockerPanel(){
+  playAudio('panel');
+  if (!ONLINE_API_BASE){
+    adminFormPanelEl.innerHTML = '<div class="admin-form-head"><div class="afh-eyebrow">AGENTE</div><div class="afh-title">ARQUIVO PESSOAL</div></div>'+
+      '<div class="admin-form-body"><div class="admin-hint">Este recurso precisa do backend online (parâmetro ?api=) para funcionar — os arquivos são visíveis para o administrador e, quando marcados, para outros agentes, o que exige um servidor real por trás.</div>'+
+      '<div class="admin-btn-row"><button class="admin-btn" id="locker-close">FECHAR</button></div></div>';
+    adminFormPanelEl.classList.add('open');
+    document.getElementById('locker-close').addEventListener('click', closeAdminForm);
+    return;
+  }
+  logClientAudit('abrir_arquivo_pessoal', null);
+  LOCKER_STATE.files = await apiFilesList(STATE.currentUser) || [];
+  renderLockerPanel();
+}
+function lockerFolders(){ return Array.from(new Set(LOCKER_STATE.files.map(f=>f.folder).filter(Boolean))).sort(); }
+function filteredLockerFiles(){
+  let list = LOCKER_STATE.files.slice();
+  if (LOCKER_STATE.classFilter!=='ALL') list = list.filter(f=>f.classification===LOCKER_STATE.classFilter);
+  if (LOCKER_STATE.folderFilter!=='ALL') list = list.filter(f=>(f.folder||'')===LOCKER_STATE.folderFilter);
+  const q = LOCKER_STATE.search.trim().toLowerCase();
+  if (q) list = list.filter(f=> (f.title||'').toLowerCase().includes(q) || (f.content||'').toLowerCase().includes(q));
+  list.sort((a,b)=> LOCKER_STATE.sort==='oldest' ? new Date(a.createdAt)-new Date(b.createdAt) : new Date(b.createdAt)-new Date(a.createdAt));
+  return list;
+}
+function lockerRowHTML(f, canEdit){
+  return '<div class="locker-row">'+
+    '<div class="locker-row-head"><div><span class="locker-row-title">'+escapeHTML(f.title)+'</span> <span class="class-badge '+f.classification+'">'+CLASS_LABEL[f.classification]+'</span>'+
+    '<div class="locker-row-meta">'+FILE_TYPE_LABEL[f.type]+(f.folder?' · 📁 '+escapeHTML(f.folder):'')+' · '+new Date(f.createdAt).toLocaleString('pt-BR')+' · '+escapeHTML(f.owner)+'</div></div>'+
+    (canEdit ? '<div class="locker-row-actions"><button data-locker-edit="'+f.id+'">EDITAR</button><button data-locker-del="'+f.id+'">EXCLUIR</button></div>' : '<div class="locker-row-actions"><button data-locker-del="'+f.id+'">EXCLUIR</button></div>')+
+    '</div>'+
+    (f.content ? '<div class="locker-row-body">'+escapeHTML(f.content)+'</div>' : '')+
+    (f.dataUrl ? '<img class="locker-row-img" src="'+f.dataUrl+'">' : '')+
+    '</div>';
+}
+function renderLockerPanel(){
+  const folders = lockerFolders();
+  const list = filteredLockerFiles();
+  let html = '<div class="admin-form-head"><div class="afh-eyebrow">AGENTE // '+escapeHTML(STATE.agentName||'')+'</div><div class="afh-title">ARQUIVO PESSOAL</div></div>'+
+    '<div class="admin-form-body">'+
+    '<div class="locker-toolbar">'+
+      '<input id="locker-search" type="text" placeholder="Buscar..." value="'+escapeHTML(LOCKER_STATE.search)+'">'+
+      '<select id="locker-class-filter"><option value="ALL">TODAS AS CLASSIFICAÇÕES</option>'+Object.keys(CLASS_LABEL).map(c=>'<option value="'+c+'" '+(LOCKER_STATE.classFilter===c?'selected':'')+'>'+CLASS_LABEL[c]+'</option>').join('')+'</select>'+
+      (folders.length ? '<select id="locker-folder-filter"><option value="ALL">TODAS AS PASTAS</option>'+folders.map(f=>'<option value="'+escapeHTML(f)+'" '+(LOCKER_STATE.folderFilter===f?'selected':'')+'>'+escapeHTML(f)+'</option>').join('')+'</select>' : '')+
+      '<select id="locker-sort"><option value="newest" '+(LOCKER_STATE.sort==='newest'?'selected':'')+'>MAIS RECENTE</option><option value="oldest" '+(LOCKER_STATE.sort==='oldest'?'selected':'')+'>MAIS ANTIGO</option></select>'+
+    '</div>'+
+    '<div class="admin-btn-row"><button class="admin-btn primary" id="locker-new">+ NOVO</button><button class="admin-btn" id="locker-close">FECHAR</button></div>'+
+    '<div class="locker-list">'+(list.length ? list.map(f=>lockerRowHTML(f,true)).join('') : '<div class="news-admin-blank">NENHUM ITEM ENCONTRADO.</div>')+'</div>'+
+    '</div>';
+  adminFormPanelEl.innerHTML = html;
+  adminFormPanelEl.classList.add('open');
+  document.getElementById('locker-close').addEventListener('click', closeAdminForm);
+  document.getElementById('locker-new').addEventListener('click', ()=> openLockerEditor(null));
+  document.getElementById('locker-search').addEventListener('input', ev=>{ LOCKER_STATE.search = ev.target.value; renderLockerPanel(); document.getElementById('locker-search').focus(); document.getElementById('locker-search').setSelectionRange(LOCKER_STATE.search.length, LOCKER_STATE.search.length); });
+  document.getElementById('locker-class-filter').addEventListener('change', ev=>{ LOCKER_STATE.classFilter = ev.target.value; renderLockerPanel(); });
+  const folderSel = document.getElementById('locker-folder-filter');
+  if (folderSel) folderSel.addEventListener('change', ev=>{ LOCKER_STATE.folderFilter = ev.target.value; renderLockerPanel(); });
+  document.getElementById('locker-sort').addEventListener('change', ev=>{ LOCKER_STATE.sort = ev.target.value; renderLockerPanel(); });
+  adminFormPanelEl.querySelectorAll('[data-locker-edit]').forEach(btn=> btn.addEventListener('click', ()=> openLockerEditor(LOCKER_STATE.files.find(f=>f.id===btn.dataset.lockerEdit))));
+  adminFormPanelEl.querySelectorAll('[data-locker-del]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    if (!window.confirm('Excluir este item do arquivo pessoal?')) return;
+    try{ await apiFileDelete(btn.dataset.lockerDel); }catch(e){ alert('Não foi possível excluir.'); return; }
+    playAudio('cancel');
+    LOCKER_STATE.files = await apiFilesList(STATE.currentUser) || [];
+    renderLockerPanel();
+  }));
+}
+function openLockerEditor(existing){
+  const isNew = !existing;
+  let pendingDataUrl = existing ? existing.dataUrl : null;
+  let html = '<div class="admin-form-head"><div class="afh-eyebrow">ARQUIVO PESSOAL</div><div class="afh-title">'+(isNew?'NOVO ITEM':'EDITAR ITEM')+'</div></div>'+
+    '<div class="admin-form-body">'+
+    '<div class="admin-field"><label>TIPO</label><select id="lk-type">'+Object.keys(FILE_TYPE_LABEL).map(t=>'<option value="'+t+'" '+((existing?existing.type:'nota')===t?'selected':'')+'>'+FILE_TYPE_LABEL[t]+'</option>').join('')+'</select></div>'+
+    '<div class="admin-field"><label>TÍTULO</label><input id="lk-title" type="text" value="'+escapeHTML(existing?existing.title:'')+'"></div>'+
+    '<div class="admin-field"><label>PASTA (opcional)</label><input id="lk-folder" type="text" placeholder="ex: investigação-vorne" value="'+escapeHTML(existing?existing.folder:'')+'"></div>'+
+    '<div class="admin-field"><label>CONTEÚDO / ANOTAÇÃO</label><textarea id="lk-content" rows="6">'+escapeHTML(existing?existing.content:'')+'</textarea></div>'+
+    '<div class="admin-field"><label>IMAGEM (opcional)</label><input id="lk-image" type="file" accept="image/*"><div id="lk-image-preview">'+(pendingDataUrl?'<img class="locker-row-img" src="'+pendingDataUrl+'">':'')+'</div></div>'+
+    '<div class="admin-field"><label>CLASSIFICAÇÃO</label><select id="lk-class">'+Object.keys(CLASS_LABEL).map(c=>'<option value="'+c+'" '+((existing?existing.classification:'PESSOAL')===c?'selected':'')+'>'+CLASS_LABEL[c]+'</option>').join('')+'</select>'+
+      '<div class="admin-hint">PESSOAL: só você. CONFIDENCIAL: você e o admin. EVIDÊNCIA: você e o admin, ligado a investigações. COMPARTILHADO: admin e, se marcado abaixo, outros agentes.</div></div>'+
+    '<div class="admin-field" id="lk-share-row" style="display:'+((existing?existing.classification:'')==='COMPARTILHADO'?'block':'none')+'"><label><input type="checkbox" id="lk-shared" '+(existing&&existing.sharedWithAgents?'checked':'')+'> Visível para outros agentes também (não só o admin)</label></div>'+
+    '<div class="admin-btn-row"><button class="admin-btn primary" id="lk-save">SALVAR</button><button class="admin-btn" id="lk-cancel">CANCELAR</button></div>'+
+    '</div>';
+  adminFormPanelEl.innerHTML = html;
+  document.getElementById('lk-class').addEventListener('change', ev=>{ document.getElementById('lk-share-row').style.display = ev.target.value==='COMPARTILHADO' ? 'block' : 'none'; });
+  document.getElementById('lk-cancel').addEventListener('click', ()=> renderLockerPanel());
+  document.getElementById('lk-image').addEventListener('change', async ev=>{
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    try{
+      pendingDataUrl = await compressImageFile(file, 1200, 1200, 0.8);
+      document.getElementById('lk-image-preview').innerHTML = '<img class="locker-row-img" src="'+pendingDataUrl+'">';
+    }catch(e){ alert('Não foi possível processar essa imagem.'); }
+  });
+  document.getElementById('lk-save').addEventListener('click', async ()=>{
+    const payload = {
+      type: document.getElementById('lk-type').value,
+      title: document.getElementById('lk-title').value.trim() || 'SEM TÍTULO',
+      folder: document.getElementById('lk-folder').value.trim(),
+      content: document.getElementById('lk-content').value,
+      classification: document.getElementById('lk-class').value,
+      sharedWithAgents: document.getElementById('lk-shared') ? document.getElementById('lk-shared').checked : false,
+      dataUrl: pendingDataUrl
+    };
+    try{
+      if (isNew) await apiFileCreate(payload); else await apiFileUpdate(existing.id, payload);
+    }catch(e){ alert('Não foi possível salvar.'); return; }
+    playAudio('confirm');
+    LOCKER_STATE.files = await apiFilesList(STATE.currentUser) || [];
+    renderLockerPanel();
+  });
+}
+
+/* ---- Admin: CONTEÚDO PESSOAL DOS AGENTES ---- */
+async function openAgentFilesAdminPanel(){
+  if (!ONLINE_API_BASE){ alert('Este recurso precisa do backend online configurado.'); return; }
+  const agents = (await listAccounts()).filter(a=>a.role!=='admin');
+  let html = '<div class="admin-form-head"><div class="afh-eyebrow">L.O.B. // COMMAND</div><div class="afh-title">CONTEÚDO PESSOAL DOS AGENTES</div></div>'+
+    '<div class="admin-form-body"><div class="admin-hint">Itens classificados como PESSOAL nunca aparecem aqui — só o próprio agente tem acesso a eles.</div>'+
+    '<div class="admin-btn-row"><button class="admin-btn" id="agentfiles-close">FECHAR</button></div>';
+  if (!agents.length) html += '<div class="news-admin-blank">NENHUM AGENTE CADASTRADO.</div>';
+  else agents.forEach(a => html += '<div class="agentfiles-list-item" data-agent="'+escapeHTML(a.username)+'"><span>'+escapeHTML(a.displayName||a.username)+'</span><span class="locker-row-meta">'+escapeHTML(a.username)+'</span></div>');
+  html += '</div>';
+  adminFormPanelEl.innerHTML = html;
+  adminFormPanelEl.classList.add('open');
+  document.getElementById('agentfiles-close').addEventListener('click', closeAdminForm);
+  adminFormPanelEl.querySelectorAll('[data-agent]').forEach(row=> row.addEventListener('click', ()=> openAgentFilesView(row.dataset.agent)));
+}
+async function openAgentFilesView(username){
+  const files = await apiFilesList(username) || [];
+  let html = '<div class="admin-form-head"><div class="afh-eyebrow">CONTEÚDO PESSOAL</div><div class="afh-title">'+escapeHTML(username)+'</div></div>'+
+    '<div class="admin-form-body"><div class="admin-btn-row"><button class="admin-btn" id="agentfiles-back">VOLTAR</button></div>'+
+    '<div class="locker-list">'+(files.length ? files.map(f=>lockerRowHTML(f,false)).join('') : '<div class="news-admin-blank">NENHUM ITEM VISÍVEL PARA O ADMIN.</div>')+'</div></div>';
+  adminFormPanelEl.innerHTML = html;
+  document.getElementById('agentfiles-back').addEventListener('click', openAgentFilesAdminPanel);
+  adminFormPanelEl.querySelectorAll('[data-locker-del]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    if (!window.confirm('Excluir este item (moderação)?')) return;
+    try{ await apiFileDelete(btn.dataset.lockerDel); }catch(e){ alert('Não foi possível excluir.'); return; }
+    openAgentFilesView(username);
+  }));
+}
+
+/* ---- Admin: AUDIT LOG ---- */
+async function openAuditLogPanel(){
+  if (!ONLINE_API_BASE){ alert('Este recurso precisa do backend online configurado.'); return; }
+  let entries = [];
+  try{ entries = (await onlineRequest('/audit?limit=300')).entries || []; }catch(e){}
+  let html = '<div class="admin-form-head"><div class="afh-eyebrow">L.O.B. // COMMAND</div><div class="afh-title">AUDIT LOG</div></div>'+
+    '<div class="admin-form-body"><div class="admin-btn-row"><button class="admin-btn" id="audit-close">FECHAR</button></div>';
+  if (!entries.length) html += '<div class="news-admin-blank">SEM REGISTROS AINDA.</div>';
+  else entries.forEach(e => html += '<div class="audit-row"><strong>'+escapeHTML(e.username)+'</strong> · '+escapeHTML(e.action)+(e.detail?' · '+escapeHTML(e.detail):'')+'<br>'+new Date(e.created_at).toLocaleString('pt-BR')+'</div>');
+  html += '</div>';
+  adminFormPanelEl.innerHTML = html;
+  adminFormPanelEl.classList.add('open');
+  document.getElementById('audit-close').addEventListener('click', closeAdminForm);
+}
+
+/* ---- Admin: BACKUP ---- */
+async function downloadBackup(){
+  if (!ONLINE_API_BASE){ alert('Este recurso precisa do backend online configurado.'); return; }
+  try{
+    const data = await onlineRequest('/admin/backup');
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'karsk-backup-'+new Date().toISOString().slice(0,10)+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    playAudio('confirm');
+  }catch(e){ alert('Não foi possível gerar o backup agora.'); }
+}
+
 function startWorldClock(){
   if (worldTickHandle) clearInterval(worldTickHandle);
   worldTickHandle = setInterval(()=>{
@@ -5154,6 +5415,7 @@ function setupStaticUI(){
   });
   document.getElementById('btn-map3d').addEventListener('click', ()=> openMap3d());
   document.getElementById('btn-live').addEventListener('click', openLivePanel);
+  document.getElementById('btn-locker').addEventListener('click', openLockerPanel);
   document.getElementById('live-close').addEventListener('click', closeLivePanel);
   document.querySelectorAll('.live-tab').forEach(tab=>tab.addEventListener('click', ()=>{ LIVE_STATE.activeTab=tab.dataset.liveTab; renderLivePanel(); }));
   document.getElementById('btn-search').addEventListener('click', openSearch);
@@ -5177,6 +5439,9 @@ function setupStaticUI(){
       if (btn.dataset.tool==='news'){ openNewsAdminPanel(); return; }
       if (btn.dataset.tool==='archive'){ openMissionArchivePanel(); return; }
       if (btn.dataset.tool==='mapbg'){ triggerMapUpload(); return; }
+      if (btn.dataset.tool==='agentfiles'){ openAgentFilesAdminPanel(); return; }
+      if (btn.dataset.tool==='auditlog'){ openAuditLogPanel(); return; }
+      if (btn.dataset.tool==='backup'){ downloadBackup(); return; }
       if (btn.dataset.tool==='mapreset'){
         if (window.confirm('Restaurar o mapa base original? Isso substitui o mapa atual para todos os agentes que abrirem este arquivo.')){
           resetMapBackground();
