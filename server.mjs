@@ -198,6 +198,16 @@ app.post('/api/live/states', auth, admin, ah(async (req, res) => {
   await run('INSERT INTO city_states VALUES (?, ?, ?, ?, ?, ?, ?)', Object.values(state));
   broadcastLive('state',state); res.status(201).json({ state });
 }));
+app.delete('/api/live/events/:id', auth, admin, ah(async (req, res) => {
+  await run('DELETE FROM live_events WHERE id=?', [req.params.id]);
+  broadcastLive('event_deleted', { id: req.params.id });
+  res.json({ ok: true });
+}));
+app.delete('/api/live/transmissions/:id', auth, admin, ah(async (req, res) => {
+  await run('DELETE FROM live_transmissions WHERE id=?', [req.params.id]);
+  broadcastLive('transmission_deleted', { id: req.params.id });
+  res.json({ ok: true });
+}));
 
 app.get('/api/users', auth, admin, ah(async (_req, res) => res.json({ users: (await all('SELECT * FROM users ORDER BY username')).map(publicUser) })));
 app.post('/api/users', auth, admin, ah(async (req, res) => {

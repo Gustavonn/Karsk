@@ -776,6 +776,8 @@ body.crt-high #crt-flicker{animation:crt-flicker-anim 6s infinite;}
 .live-row{display:grid;grid-template-columns:130px 1fr auto;gap:12px;border-bottom:1px solid rgba(160,127,66,.18);padding:9px 0;align-items:start;}
 .live-row strong{color:var(--parchment);}.live-meta{color:var(--phosphor);font-size:9px;letter-spacing:.08em;}.live-warn{color:var(--danger);}.live-empty{padding:28px;text-align:center;color:var(--parchment-faint);}
 .live-admin-actions{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;}.live-admin-actions button{background:var(--petrol);border:1px solid var(--petrol-bright);color:var(--parchment);padding:7px 9px;font-family:var(--font-mono);font-size:9px;}
+.live-del-btn{margin-top:6px;background:rgba(140,40,30,.25);border:1px solid rgba(200,80,60,.6);color:#e8b8ab;padding:3px 7px;font-family:var(--font-mono);font-size:8px;letter-spacing:.05em;cursor:pointer;}
+.live-del-btn:hover{background:rgba(180,50,35,.4);}
 @media (max-width:760px){#map-3d-toolbar{top:64px;left:12px;}#map-3d-status{left:12px;bottom:92px;}}
 
 /* boot / access-denied stamp */
@@ -1597,7 +1599,8 @@ const AUDIO_KIND_MAP = {
   cancel:           {frequency:240, duration:.1,  category:'ui',    wave:'triangle'},
   discovery:        {frequency:880, duration:.2,  category:'sfx',   wave:'sine'},
   access_denied:    {frequency:110, duration:.3,  category:'sfx',   wave:'sawtooth'},
-  access_granted:   {frequency:700, duration:.18, category:'sfx',   wave:'sine'}
+  access_granted:   {frequency:700, duration:.18, category:'sfx',   wave:'sine'},
+  live_alert:       {frequency:920, duration:.09, category:'radio', wave:'sine', assetFolder:'radio', chirpFrequency:620, chirpGap:.1}
 };
 
 function playAudio(kind){
@@ -1605,19 +1608,23 @@ function playAudio(kind){
   const map = AUDIO_KIND_MAP[kind] || {frequency:300, duration:.08, category:'sfx', wave:'triangle'};
   const busVolume = AUDIO_SETTINGS[map.category]!=null ? AUDIO_SETTINGS[map.category] : AUDIO_SETTINGS.sfx;
   if (tryPlayAudioAsset(map.assetFolder || map.category, kind, busVolume*AUDIO_SETTINGS.master)) return;
+  playTone(map.frequency, map.duration, map.wave, map.category);
+  if (map.chirpFrequency) setTimeout(()=>playTone(map.chirpFrequency, map.duration, map.wave, map.category), map.chirpGap*1000);
+}
+function playTone(frequency, duration, wave, category){
   const now = audioContext.currentTime;
   const oscillator = audioContext.createOscillator();
   const filter = audioContext.createBiquadFilter();
   const gain = audioContext.createGain();
-  oscillator.type = map.wave; oscillator.frequency.setValueAtTime(map.frequency, now);
-  filter.type = map.category==='radio' ? 'bandpass' : 'lowpass';
-  filter.frequency.setValueAtTime(map.category==='radio' ? map.frequency*1.8 : map.frequency*4.5, now);
-  filter.Q.value = map.category==='radio' ? 2.4 : 0.7;
+  oscillator.type = wave; oscillator.frequency.setValueAtTime(frequency, now);
+  filter.type = category==='radio' ? 'bandpass' : 'lowpass';
+  filter.frequency.setValueAtTime(category==='radio' ? frequency*1.8 : frequency*4.5, now);
+  filter.Q.value = category==='radio' ? 2.4 : 0.7;
   gain.gain.setValueAtTime(.0001, now);
-  gain.gain.exponentialRampToValueAtTime(map.category==='radio' ? .11 : .13, now+.018);
-  gain.gain.exponentialRampToValueAtTime(.0001, now+map.duration);
-  oscillator.connect(filter); filter.connect(gain); gain.connect(audioNodes[map.category]);
-  oscillator.start(now); oscillator.stop(now+map.duration+.02);
+  gain.gain.exponentialRampToValueAtTime(category==='radio' ? .11 : .13, now+.018);
+  gain.gain.exponentialRampToValueAtTime(.0001, now+duration);
+  oscillator.connect(filter); filter.connect(gain); gain.connect(audioNodes[category]);
+  oscillator.start(now); oscillator.stop(now+duration+.02);
 }
 
 async function loadCustomEntitiesFrom(shared){
@@ -1736,12 +1743,38 @@ async function loadLiveLocal(){
   LIVE_STATE.activeState = LIVE_STATE.states.find(state=>state.active) || LIVE_STATE.states[0] || null;
 }
 async function saveLiveLocal(type){ await Store.set(LIVE_KEYS[type],JSON.stringify(LIVE_STATE[type]),true); }
+const SEEN_LIVE_STORE_KEY = 'karsk:seen-live';
+let SEEN_LIVE_IDS = new Set();
+let seenLiveLoaded = false;
+let seenLiveIsFreshBootstrap = false;
+async function ensureSeenLiveLoaded(){
+  if (seenLiveLoaded) return;
+  seenLiveLoaded = true;
+  const raw = await Store.get(SEEN_LIVE_STORE_KEY, false);
+  if (raw){ try{ SEEN_LIVE_IDS = new Set(JSON.parse(raw)); }catch(e){ SEEN_LIVE_IDS = new Set(); } }
+  else { seenLiveIsFreshBootstrap = true; }
+}
+function persistSeenLiveIds(){ Store.set(SEEN_LIVE_STORE_KEY, JSON.stringify(Array.from(SEEN_LIVE_IDS).slice(-400)), false); }
 async function refreshLive(){
   if (ONLINE_API_BASE){ try{ const data=await onlineRequest('/live/snapshot'); Object.assign(LIVE_STATE,{presence:data.presence||[],events:data.events||[],transmissions:data.transmissions||[],states:data.states||[]}); LIVE_STATE.activeState=LIVE_STATE.states.find(state=>state.active)||LIVE_STATE.states[0]||null; }catch(e){} }
   else await loadLiveLocal();
-  const previousEvents=LIVE_STATE.events.map(item=>item.id).join('|');
+  await ensureSeenLiveLoaded();
+  const freshlyNew = [];
+  LIVE_STATE.events.forEach(event=>{ const key='evt:'+event.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'event', item:event}); } });
+  LIVE_STATE.transmissions.forEach(tx=>{ const key='tx:'+tx.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'transmission', item:tx}); } });
   renderLivePanel(); renderMarkers(); updateLiveHud();
-  if (previousEvents!==LIVE_STATE.events.map(item=>item.id).join('|') && activeLiveEvents().length){ playAudio('notification'); showDiscoveryToast('PRIORITY EVENT',activeLiveEvents()[0].title); }
+  if (freshlyNew.length){
+    persistSeenLiveIds();
+    if (!seenLiveIsFreshBootstrap){
+      playAudio('live_alert');
+      const first = freshlyNew[0];
+      const isEvent = first.kind==='event';
+      const heading = isEvent ? (['HIGH','CRITICAL'].includes(first.item.severity) ? '[ AVISO IMPORTANTE ]' : '[ NOVO EVENTO ]') : '[ RÁDIO L.O.B. ]';
+      const label = freshlyNew.length>1 ? freshlyNew.length+' novos registros disponíveis' : (isEvent ? (first.item.title||'Novo evento disponível.') : (first.item.body||first.item.sender||'Nova transmissão disponível.'));
+      showDiscoveryToast(heading, label);
+    }
+  }
+  seenLiveIsFreshBootstrap = false;
 }
 function activeLiveEvents(){ const now=Date.now(); return LIVE_STATE.events.filter(event=>event.active!==0 && (!event.start_at || new Date(event.start_at).getTime()<=now) && (!event.end_at || new Date(event.end_at).getTime()>now)); }
 function updateLiveHud(){
@@ -1775,12 +1808,29 @@ function renderLivePanel(){
   if (LIVE_STATE.activeTab==='agents'){
     const online=LIVE_STATE.presence.filter(item=>item.online).length; html+='<div class="live-meta">AGENTS ONLINE: '+online+'</div>';
     html+=LIVE_STATE.presence.length?LIVE_STATE.presence.map(item=>'<div class="live-row"><strong>'+liveText(item.agentId||item.userId)+'</strong><span>'+liveText(item.status)+'<br>LOCAL: '+liveText(item.locationId||item.districtId||item.regionId||'CENTRAL')+'</span><span class="live-meta">'+(item.online?'ONLINE':'OFFLINE')+'</span></div>').join(''):'<div class="live-empty">NENHUM AGENTE REGISTRADO</div>';
-  } else if (LIVE_STATE.activeTab==='radio') html+=LIVE_STATE.transmissions.length?LIVE_STATE.transmissions.map(item=>'<div class="live-row"><span class="live-meta">['+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+']</span><span><strong>'+liveText(item.sender)+'</strong><br>'+liveText(item.body)+'</span><span class="live-meta '+(item.urgent?'live-warn':'')+'">'+liveText(item.type)+'<br>'+liveText(item.interference)+'</span></div>').join(''):'<div class="live-empty">NENHUMA TRANSMISSÃO</div>';
-  else if (LIVE_STATE.activeTab==='events') html+=active.length?active.map(event=>'<div class="live-row"><span class="live-meta">'+liveText(event.type)+'</span><span><strong>'+liveText(event.title)+'</strong><br>'+liveText(event.description)+'</span><span class="live-meta '+(['HIGH','CRITICAL'].includes(event.severity)?'live-warn':'')+'">'+liveText(event.severity)+'<br>CHAOS '+Number(event.chaos_delta||0)+'</span></div>').join(''):'<div class="live-empty">NENHUM EVENTO ATIVO</div>';
+  } else if (LIVE_STATE.activeTab==='radio') html+=LIVE_STATE.transmissions.length?LIVE_STATE.transmissions.map(item=>'<div class="live-row"><span class="live-meta">['+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+']</span><span><strong>'+liveText(item.sender)+'</strong><br>'+liveText(item.body)+'</span><span class="live-meta '+(item.urgent?'live-warn':'')+'">'+liveText(item.type)+'<br>'+liveText(item.interference)+(STATE.role==='admin'?'<br><button class="live-del-btn" data-del-transmission="'+liveText(item.id)+'">EXCLUIR</button>':'')+'</span></div>').join(''):'<div class="live-empty">NENHUMA TRANSMISSÃO</div>';
+  else if (LIVE_STATE.activeTab==='events'){ const eventList = STATE.role==='admin' ? LIVE_STATE.events : active; html+=eventList.length?eventList.map(event=>'<div class="live-row"><span class="live-meta">'+liveText(event.type)+(event.active===0?'<br>(inativo)':'')+'</span><span><strong>'+liveText(event.title)+'</strong><br>'+liveText(event.description)+'</span><span class="live-meta '+(['HIGH','CRITICAL'].includes(event.severity)?'live-warn':'')+'">'+liveText(event.severity)+'<br>CHAOS '+Number(event.chaos_delta||0)+(STATE.role==='admin'?'<br><button class="live-del-btn" data-del-event="'+liveText(event.id)+'">EXCLUIR</button>':'')+'</span></div>').join(''):'<div class="live-empty">NENHUM EVENTO ATIVO</div>'; }
   else if (LIVE_STATE.activeTab==='timeline') html+=LIVE_STATE.events.concat(LIVE_STATE.transmissions).sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0)).map(item=>'<div class="live-row"><span class="live-meta">'+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+'</span><span><strong>'+liveText(item.title||item.sender||item.type)+'</strong><br>'+liveText(item.description||item.body||'')+'</span><span class="live-meta">'+liveText(item.type||'RADIO')+'</span></div>').join('')||'<div class="live-empty">LOG VAZIO</div>';
   else { const state=LIVE_STATE.activeState; html+='<div class="live-meta">KARSK · '+new Date().toLocaleTimeString('pt-BR')+'</div><div class="live-empty"><strong>'+liveText(state?state.name:'PRESENTE')+'</strong><br>'+liveText(state?state.description:'ESTADO OPERACIONAL ATUAL')+'<br><br>EVENTOS ATIVOS: '+active.length+'<br>AGENTES ONLINE: '+LIVE_STATE.presence.filter(item=>item.online).length+'<br>CAOS: '+Math.round(STATE.chaos)+'%</div>'; }
   body.innerHTML=html;
   body.querySelectorAll('[data-live-create]').forEach(button=>button.addEventListener('click',()=>createLiveRecord(button.dataset.liveCreate)));
+  body.querySelectorAll('[data-del-event]').forEach(button=>button.addEventListener('click',(ev)=>{ ev.stopPropagation(); deleteLiveRecord('event', button.dataset.delEvent); }));
+  body.querySelectorAll('[data-del-transmission]').forEach(button=>button.addEventListener('click',(ev)=>{ ev.stopPropagation(); deleteLiveRecord('transmission', button.dataset.delTransmission); }));
+}
+async function deleteLiveRecord(kind, id){
+  if (STATE.role!=='admin') return;
+  const label = kind==='event' ? 'este evento' : 'esta transmissão';
+  if (!window.confirm('Deseja realmente excluir '+label+'?')) return;
+  if (ONLINE_API_BASE){
+    try{ await onlineRequest('/live/'+(kind==='event'?'events':'transmissions')+'/'+encodeURIComponent(id), {method:'DELETE'}); }
+    catch(e){ alert('Não foi possível excluir. Tente novamente.'); return; }
+  } else {
+    if (kind==='event') LIVE_STATE.events = LIVE_STATE.events.filter(item=>item.id!==id);
+    else LIVE_STATE.transmissions = LIVE_STATE.transmissions.filter(item=>item.id!==id);
+    await saveLiveLocal(kind==='event'?'events':'transmissions');
+  }
+  playAudio('cancel');
+  await refreshLive();
 }
 async function createLiveRecord(kind){
   if (STATE.role!=='admin') return;
@@ -2105,7 +2155,7 @@ function interruptFlight(){
 }
 
 /* ---- pan (drag) — dampened for a heavier, more deliberate strategic-map feel ---- */
-const PAN_DAMPING = 0.18;
+const PAN_DAMPING = 0.11;
 function screenDeltaToWorldPct(dxScreen, dyScreen){
   // convert screen-space pixel delta to world-percent delta, accounting for zoom
   const rect = cameraViewportEl.getBoundingClientRect();
@@ -2147,7 +2197,7 @@ function startMomentum(vx, vy){
   if (Math.abs(vx)+Math.abs(vy) < 0.002) return;
   function step(){
     STATE.camera.x += vx; STATE.camera.y += vy;
-    vx *= 0.78; vy *= 0.78;
+    vx *= 0.88; vy *= 0.88;
     clampCamera();
     applyCameraTransform();
     if (Math.abs(vx)+Math.abs(vy) > 0.0015){
@@ -3495,6 +3545,23 @@ function findEntityFromEvent(ev){
 function setupMapInteractions(){
   let isDown = false, lastX=0, lastY=0, movedFar=false;
   let lastMoveT=0, velX=0, velY=0;
+  let dragTargetX=0, dragTargetY=0, dragEaseHandle=null;
+  const DRAG_EASE = 0.24; // higher = snappier follow, lower = more lag/fluidity
+
+  function dragEaseStep(){
+    const dxRemain = dragTargetX - STATE.camera.x, dyRemain = dragTargetY - STATE.camera.y;
+    STATE.camera.x += dxRemain * DRAG_EASE;
+    STATE.camera.y += dyRemain * DRAG_EASE;
+    STATE.camera.targetZoom = STATE.camera.zoom;
+    clampCamera();
+    applyCameraTransform();
+    if (isDown || Math.abs(dxRemain)+Math.abs(dyRemain) > 0.01){
+      dragEaseHandle = requestAnimationFrame(dragEaseStep);
+    } else {
+      dragEaseHandle = null;
+    }
+  }
+  function ensureDragEaseRunning(){ if (!dragEaseHandle) dragEaseHandle = requestAnimationFrame(dragEaseStep); }
 
   cameraViewportEl.addEventListener('mousedown', (ev)=>{
     if (STATE.adminMode && STATE.adminTool!=='select') return;
@@ -3502,6 +3569,7 @@ function setupMapInteractions(){
     isDown = true; movedFar=false;
     lastX = ev.clientX; lastY = ev.clientY;
     lastMoveT = performance.now(); velX=0; velY=0;
+    dragTargetX = STATE.camera.x; dragTargetY = STATE.camera.y;
     stopMomentum();
     cameraViewportEl.classList.add('dragging');
   });
@@ -3517,11 +3585,9 @@ function setupMapInteractions(){
     // exponential smoothing of velocity so a single jittery frame doesn't dominate the glide
     velX = Math.max(-0.045, Math.min(0.045, velX*0.72 + (delta.dx*100 * (16/dt))*0.18));
     velY = Math.max(-0.045, Math.min(0.045, velY*0.72 + (delta.dy*100 * (16/dt))*0.18));
-    STATE.camera.x += delta.dx*100;
-    STATE.camera.y += delta.dy*100;
-    STATE.camera.targetZoom = STATE.camera.zoom;
-    clampCamera();
-    applyCameraTransform();
+    dragTargetX += delta.dx*100;
+    dragTargetY += delta.dy*100;
+    ensureDragEaseRunning();
   });
   window.addEventListener('mouseup', ()=>{
     if (isDown) startMomentum(velX, velY);
