@@ -184,8 +184,6 @@ body.reduced-motion *{animation-duration:0.001ms !important; transition-duration
 #camera-viewport{
   position:absolute;inset:0;
   overflow:hidden;
-  perspective:1400px;
-  perspective-origin:50% 38%;
   background:#04070a;
   cursor:grab;
 }
@@ -197,10 +195,9 @@ body.reduced-motion *{animation-duration:0.001ms !important; transition-duration
   left:50%;top:50%;
   width:1600px;height:1067px;
   margin-left:-800px;margin-top:-533.5px;
-  transform-style:preserve-3d;
   will-change:transform;
 }
-.world-layer{position:absolute;inset:0;transform-style:preserve-3d;}
+.world-layer{position:absolute;inset:0;}
 #map-base-img{
   position:absolute;inset:0;width:100%;height:100%;object-fit:contain;
   filter:saturate(0.92) contrast(1.03);
@@ -2184,10 +2181,9 @@ function applyCameraTransform(){
   const local = pct2local(cam.x, cam.y);
   const offsetX = local.x - WORLD_W/2;
   const offsetY = local.y - WORLD_H/2;
-  const pitch = STATE.reducedMotion ? 0 : pitchForZoom(cam.zoom);
-  cam.pitch = pitch;
+  cam.pitch = 0;
   worldEl.style.transform =
-    'rotateX('+pitch.toFixed(2)+'deg) scale('+cam.zoom.toFixed(4)+') translate('+(-offsetX).toFixed(2)+'px,'+(-offsetY).toFixed(2)+'px)';
+    'scale('+cam.zoom.toFixed(4)+') translate('+(-offsetX).toFixed(2)+'px,'+(-offsetY).toFixed(2)+'px)';
   updateMinimap();
   updateCoordReadout();
   updateVisibility();
