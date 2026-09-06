@@ -182,7 +182,7 @@ app.get('/api/live/stream', auth, (req, res) => {
 app.get('/api/live/snapshot', auth, ah(async (req, res) => {
   const permissions=permissionsFor(req.user), allowed=new Set(permissions.allowedRegionIds||[]);
   const visibleRegion=(regionId,districtId)=>req.user.role==='admin'||permissions.allRegions||(!regionId&&!districtId)||allowed.has(regionId)||allowed.has(districtId);
-  const presenceRows = await all('SELECT username AS userId, username AS agentId, status, region_id AS regionId, district_id AS districtId, location_id AS locationId, online, visible_to_agents AS visibleToAgents, last_seen AS lastSeen FROM live_presence WHERE online=1 OR last_seen>?', [Date.now()-120000]);
+  const presenceRows = await all('SELECT p.username AS userId, p.username AS agentId, u.display_name AS displayName, p.status, p.region_id AS regionId, p.district_id AS districtId, p.location_id AS locationId, p.online, p.visible_to_agents AS visibleToAgents, p.last_seen AS lastSeen FROM live_presence p LEFT JOIN users u ON u.username=p.username WHERE p.online=1 OR p.last_seen>?', [Date.now()-120000]);
   const presence = presenceRows.filter(item => (req.user.role==='admin' || item.visibleToAgents) && visibleRegion(item.regionId,item.districtId));
   const eventRows = await all('SELECT * FROM live_events WHERE active=1 ORDER BY created_at DESC LIMIT 100');
   const events = eventRows.filter(item=>visibleRegion(item.region_id,item.district_id));

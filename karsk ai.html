@@ -1805,6 +1805,22 @@ async function pollSharedFilesFeed(){
     return fresh;
   }catch(e){ return []; }
 }
+async function pollNewsUpdates(){
+  const raw = await Store.get(NEWS_STORE_KEY, true);
+  if (!raw) return [];
+  let serverItems;
+  try{ serverItems = JSON.parse(raw); if (!Array.isArray(serverItems)) return []; }catch(e){ return []; }
+  const serverIds = new Set(serverItems.map(n=>n.id));
+  const currentIds = new Set(NEWS_ITEMS.map(n=>n.id));
+  const changed = serverItems.length !== NEWS_ITEMS.length || serverItems.some(n=>!currentIds.has(n.id)) || NEWS_ITEMS.some(n=>!serverIds.has(n.id));
+  if (!changed) return [];
+  const fresh = [];
+  serverItems.forEach(n=>{ const key='news:'+n.id; if (n.published && !SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); fresh.push({kind:'news', item:n}); } });
+  NEWS_ITEMS = serverItems; // single source of truth — KARSK DAILY and LIVE both read from this same array
+  if (typeof buildTickerContent === 'function') buildTickerContent();
+  if (typeof renderNewsPanel === 'function') renderNewsPanel();
+  return fresh;
+}
 async function refreshLive(){
   if (ONLINE_API_BASE){ try{ const data=await onlineRequest('/live/snapshot'); Object.assign(LIVE_STATE,{presence:data.presence||[],events:data.events||[],transmissions:data.transmissions||[],states:data.states||[]}); LIVE_STATE.activeState=LIVE_STATE.states.find(state=>state.active)||LIVE_STATE.states[0]||null; }catch(e){} }
   else await loadLiveLocal();
@@ -1813,6 +1829,7 @@ async function refreshLive(){
   LIVE_STATE.events.forEach(event=>{ const key='evt:'+event.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'event', item:event}); } });
   LIVE_STATE.transmissions.forEach(tx=>{ const key='tx:'+tx.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'transmission', item:tx}); } });
   freshlyNew.push(...await pollSharedFilesFeed());
+  freshlyNew.push(...await pollNewsUpdates());
   renderLivePanel(); renderMarkers(); updateLiveHud();
   if (freshlyNew.length){
     persistSeenLiveIds();
@@ -1822,8 +1839,8 @@ async function refreshLive(){
     if (!seenLiveIsFreshBootstrap){
       playAudio('live_alert');
       const first = freshlyNew[0];
-      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]'};
-      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"'};
+      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]', news:'[ NOVA NOTÍCIA ]'};
+      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"', news: first.item.title||'Nova notícia publicada.'};
       const heading = headingFor[first.kind];
       const label = freshlyNew.length>1 ? freshlyNew.length+' novos registros disponíveis' : labelFor[first.kind];
       showDiscoveryToast(heading, label);
@@ -1864,7 +1881,7 @@ function renderLivePanel(){
   if (STATE.role==='admin') html+='<div class="live-admin-actions"><button data-live-create="event">CRIAR EVENTO</button><button data-live-create="radio">ENVIAR RÁDIO</button><button data-live-create="state">NOVO ESTADO</button></div>';
   if (LIVE_STATE.activeTab==='agents'){
     const online=LIVE_STATE.presence.filter(item=>item.online).length; html+='<div class="live-meta">AGENTS ONLINE: '+online+'</div>';
-    html+=LIVE_STATE.presence.length?LIVE_STATE.presence.map(item=>'<div class="live-row"><strong>'+liveText(item.agentId||item.userId)+'</strong><span>'+liveText(item.status)+'<br>LOCAL: '+liveText(item.locationId||item.districtId||item.regionId||'CENTRAL')+'</span><span class="live-meta">'+(item.online?'ONLINE':'OFFLINE')+'</span></div>').join(''):'<div class="live-empty">NENHUM AGENTE REGISTRADO</div>';
+    html+=LIVE_STATE.presence.length?LIVE_STATE.presence.map(item=>'<div class="live-row"><strong>'+liveText(item.displayName||item.agentId||item.userId)+'</strong><span>'+liveText(item.status)+'<br>LOCAL: '+liveText(item.locationId||item.districtId||item.regionId||'CENTRAL')+'</span><span class="live-meta">'+(item.online?'ONLINE':'OFFLINE')+'</span></div>').join(''):'<div class="live-empty">NENHUM AGENTE REGISTRADO</div>';
   } else if (LIVE_STATE.activeTab==='radio') html+=LIVE_STATE.transmissions.length?LIVE_STATE.transmissions.map(item=>'<div class="live-row"><span class="live-meta">['+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+']</span><span><strong>'+liveText(item.sender)+'</strong><br>'+liveText(item.body)+'</span><span class="live-meta '+(item.urgent?'live-warn':'')+'">'+liveText(item.type)+'<br>'+liveText(item.interference)+(STATE.role==='admin'?'<br><button class="live-del-btn" data-del-transmission="'+liveText(item.id)+'">EXCLUIR</button>':'')+'</span></div>').join(''):'<div class="live-empty">NENHUMA TRANSMISSÃO</div>';
   else if (LIVE_STATE.activeTab==='events'){ const eventList = STATE.role==='admin' ? LIVE_STATE.events : active; html+=eventList.length?eventList.map(event=>'<div class="live-row"><span class="live-meta">'+liveText(event.type)+(event.active===0?'<br>(inativo)':'')+'</span><span><strong>'+liveText(event.title)+'</strong><br>'+liveText(event.description)+'</span><span class="live-meta '+(['HIGH','CRITICAL'].includes(event.severity)?'live-warn':'')+'">'+liveText(event.severity)+'<br>CHAOS '+Number(event.chaos_delta||0)+(STATE.role==='admin'?'<br><button class="live-del-btn" data-del-event="'+liveText(event.id)+'">EXCLUIR</button>':'')+'</span></div>').join(''):'<div class="live-empty">NENHUM EVENTO ATIVO</div>'; }
   else if (LIVE_STATE.activeTab==='timeline') html+=LIVE_STATE.events.concat(LIVE_STATE.transmissions).sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0)).map(item=>'<div class="live-row"><span class="live-meta">'+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+'</span><span><strong>'+liveText(item.title||item.sender||item.type)+'</strong><br>'+liveText(item.description||item.body||'')+'</span><span class="live-meta">'+liveText(item.type||'RADIO')+'</span></div>').join('')||'<div class="live-empty">LOG VAZIO</div>';
@@ -2146,7 +2163,9 @@ const viewportEl = null; // set on init
 let cameraEl, worldEl;
 
 const CAM_MIN_ZOOM = 0.95, CAM_MAX_ZOOM = 6.2;
-const CAM_MAX_PITCH = 22; // degrees
+const CAM_MAX_PITCH = 0; // was 22 — the 3D tilt (combined with a screen-fixed perspective-origin) was
+// visually displacing region shapes at extreme pan+zoom, making them miss clicks. Disabled at the root
+// rather than trying to compensate for it, since that compensation can't be visually verified here.
 
 function pitchForZoom(zoom){
   const t = Math.max(0, Math.min(1, (zoom-1)/(3.2-1)));
@@ -2213,7 +2232,7 @@ function interruptFlight(){
 }
 
 /* ---- pan (drag) — dampened for a heavier, more deliberate strategic-map feel ---- */
-const PAN_DAMPING = 0.055;
+const PAN_DAMPING = 0.026;
 function screenDeltaToWorldPct(dxScreen, dyScreen){
   // convert screen-space pixel delta to world-percent delta, accounting for zoom
   const rect = cameraViewportEl.getBoundingClientRect();
@@ -2239,7 +2258,7 @@ function zoomBy(factor){
         zoomEaseHandle = null;
         return;
       }
-      STATE.camera.zoom += diff * 0.16;
+      STATE.camera.zoom += diff * 0.11;
       clampCamera();
       applyCameraTransform();
       zoomEaseHandle = requestAnimationFrame(step);
@@ -2514,7 +2533,7 @@ function renderMarkers(){
     if (!entity || !canViewEntity(entity)) return;
     const el=document.createElement('div'); el.className='map-marker agent-presence'; el.style.left=entity.x+'%'; el.style.top=entity.y+'%';
     const dot=document.createElement('div'); dot.className='marker-dot'; dot.textContent='◉'; el.appendChild(dot);
-    const tag=document.createElement('div'); tag.className='marker-tag'; tag.textContent=(agent.agentId||agent.userId)+' · '+(agent.status||'ONLINE'); el.appendChild(tag);
+    const tag=document.createElement('div'); tag.className='marker-tag'; tag.textContent=(agent.displayName||agent.agentId||agent.userId)+' · '+(agent.status||'ONLINE'); el.appendChild(tag);
     el.addEventListener('click',()=>{ LIVE_STATE.activeTab='agents'; openLivePanel(); }); markerContainerEl.appendChild(el);
   });
 }
@@ -2912,11 +2931,21 @@ const KARSK_EVENTS = [
   { id:'evt-petalas', title:'Efeitos de campo em Petalas', summary:'Vibratórios de baixa frequência afetam a rede local.', regionId:'district-pet', chaosDelta:4, location:'Petalas Norte' }
 ];
 
+const TRIGGERED_WORLD_EVENTS_KEY = 'karsk:triggered-world-events';
+let TRIGGERED_WORLD_EVENTS = new Set();
+async function loadTriggeredWorldEvents(){
+  const raw = await Store.get(TRIGGERED_WORLD_EVENTS_KEY, true);
+  if (raw){ try{ TRIGGERED_WORLD_EVENTS = new Set(JSON.parse(raw)); }catch(e){ TRIGGERED_WORLD_EVENTS = new Set(); } }
+}
+function saveTriggeredWorldEvents(){ Store.set(TRIGGERED_WORLD_EVENTS_KEY, JSON.stringify(Array.from(TRIGGERED_WORLD_EVENTS)), true); }
+
 function syncWorldEventFeed(){
   if (!KARSK_EVENTS.length) return;
-  const active = KARSK_EVENTS.filter(evt => !NEWS_ITEMS.some(item => item.id === 'news-'+evt.id));
+  const active = KARSK_EVENTS.filter(evt => !TRIGGERED_WORLD_EVENTS.has(evt.id));
   if (!active.length || Math.random() > 0.26) return;
   const evt = active[Math.floor(Math.random()*active.length)];
+  TRIGGERED_WORLD_EVENTS.add(evt.id);
+  saveTriggeredWorldEvents();
   const headline = evt.title;
   const item = {
     id: 'news-'+evt.id,
@@ -3605,7 +3634,7 @@ function setupMapInteractions(){
   let isDown = false, lastX=0, lastY=0, movedFar=false;
   let lastMoveT=0, velX=0, velY=0;
   let dragTargetX=0, dragTargetY=0, dragEaseHandle=null;
-  const DRAG_EASE = 0.16; // higher = snappier follow, lower = more lag/fluidity
+  const DRAG_EASE = 0.10; // higher = snappier follow, lower = more lag/fluidity
 
   function dragEaseStep(){
     const dxRemain = dragTargetX - STATE.camera.x, dyRemain = dragTargetY - STATE.camera.y;
@@ -5336,6 +5365,7 @@ async function enterMainApp(){
   await loadAllOverrides();
   await loadAllMedia();
   await loadPersistentNews();
+  await loadTriggeredWorldEvents();
   await loadPersistentArchive();
   await loadDiscoveries();
   await loadMapTitles();
