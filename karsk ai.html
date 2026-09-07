@@ -2265,6 +2265,7 @@ function zoomBy(factor){
 
 /* ---- drag momentum — light inertia so releasing a pan glides to a stop ---- */
 let momentumHandle = null;
+let mapGestureMovedFar = false; // shared between the drag system and individual label click handlers
 function startMomentum(vx, vy){
   if (momentumHandle) cancelAnimationFrame(momentumHandle);
   if (Math.abs(vx)+Math.abs(vy) < 0.002) return;
@@ -2421,7 +2422,7 @@ function renderRegionLayer(){
     label.textContent = city.name;
     label.style.left = city.x+'%'; label.style.top = (city.y-32)+'%';
     label.style.pointerEvents = 'all';
-    label.addEventListener('click', ev=>{ ev.stopPropagation(); STATE.adminMode ? openEditEntityForm(city) : focusOnEntity(city, {}); });
+    label.addEventListener('click', ev=>{ ev.stopPropagation(); if (mapGestureMovedFar) return; STATE.adminMode ? openEditEntityForm(city) : focusOnEntity(city, {}); });
     regionLabelsEl.appendChild(label);
   });
 
@@ -2446,7 +2447,7 @@ function renderRegionLayer(){
     label.textContent = d.name;
     label.style.left = d.x+'%'; label.style.top = (d.y-8)+'%';
     label.style.pointerEvents = 'all';
-    label.addEventListener('click', ev=>{ ev.stopPropagation(); STATE.adminMode ? openEditEntityForm(d) : focusOnEntity(d, {}); });
+    label.addEventListener('click', ev=>{ ev.stopPropagation(); if (mapGestureMovedFar) return; STATE.adminMode ? openEditEntityForm(d) : focusOnEntity(d, {}); });
     districtLabelsEl.appendChild(label);
   });
 
@@ -3627,7 +3628,7 @@ function findEntityFromEvent(ev){
 }
 
 function setupMapInteractions(){
-  let isDown = false, lastX=0, lastY=0, movedFar=false;
+  let isDown = false, lastX=0, lastY=0;
   let lastMoveT=0, velX=0, velY=0;
   let dragTargetX=0, dragTargetY=0, dragEaseHandle=null;
   const DRAG_EASE = 0.10; // higher = snappier follow, lower = more lag/fluidity
@@ -3649,8 +3650,10 @@ function setupMapInteractions(){
 
   cameraViewportEl.addEventListener('mousedown', (ev)=>{
     if (STATE.adminMode && STATE.adminTool!=='select') return;
-    if (ev.target.closest('.map-marker, .zone-shape, .zone-label')) return;
-    isDown = true; movedFar=false;
+    // Dragging is allowed to start from anywhere, including on top of regions/labels/markers —
+    // movedFar (checked on click, below) decides whether this ends up being a click or a pan,
+    // so clickable map elements don't need to be excluded here.
+    isDown = true; mapGestureMovedFar = false;
     lastX = ev.clientX; lastY = ev.clientY;
     lastMoveT = performance.now(); velX=0; velY=0;
     dragTargetX = STATE.camera.x; dragTargetY = STATE.camera.y;
@@ -3660,7 +3663,7 @@ function setupMapInteractions(){
   window.addEventListener('mousemove', (ev)=>{
     if (!isDown) return;
     const dx = ev.clientX-lastX, dy = ev.clientY-lastY;
-    if (Math.abs(dx)+Math.abs(dy) > 4) movedFar = true;
+    if (Math.abs(dx)+Math.abs(dy) > 4) mapGestureMovedFar = true;
     lastX = ev.clientX; lastY = ev.clientY;
     interruptFlight();
     const delta = screenDeltaToWorldPct(dx, dy);
@@ -3731,7 +3734,7 @@ function setupMapInteractions(){
       handleAdminMapClick(ev);
       return;
     }
-    if (movedFar) return;
+    if (mapGestureMovedFar) return;
     const entity = findEntityFromEvent(ev);
     if (entity) focusOnEntity(entity, {});
   });
