@@ -3649,7 +3649,7 @@ function setupMapInteractions(){
 
   cameraViewportEl.addEventListener('mousedown', (ev)=>{
     if (STATE.adminMode && STATE.adminTool!=='select') return;
-    if (ev.target.closest('.map-marker, .zone-shape')) return;
+    if (ev.target.closest('.map-marker, .zone-shape, .zone-label')) return;
     isDown = true; movedFar=false;
     lastX = ev.clientX; lastY = ev.clientY;
     lastMoveT = performance.now(); velX=0; velY=0;
