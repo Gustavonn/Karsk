@@ -72,6 +72,47 @@ async function setupSchema() {
     CREATE TABLE IF NOT EXISTS audit_log (
       id TEXT PRIMARY KEY, username TEXT NOT NULL, action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS mission_rounds (
+      round INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'voting',
+      opened_by TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, winner_option_id TEXT
+    );
+    CREATE TABLE IF NOT EXISTS mission_options (
+      id TEXT PRIMARY KEY, round INTEGER NOT NULL, title TEXT NOT NULL, type TEXT, loc TEXT,
+      desc_text TEXT NOT NULL DEFAULT '', clues_json TEXT NOT NULL DEFAULT '[]',
+      created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+      FOREIGN KEY(round) REFERENCES mission_rounds(round) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS mission_votes (
+      round INTEGER NOT NULL, username TEXT NOT NULL, option_id TEXT NOT NULL, created_at TEXT NOT NULL,
+      PRIMARY KEY(round, username),
+      FOREIGN KEY(round) REFERENCES mission_rounds(round) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS missions (
+      id TEXT PRIMARY KEY, code TEXT, level INTEGER NOT NULL DEFAULT 1,
+      title TEXT NOT NULL, type TEXT, loc TEXT, priority TEXT NOT NULL DEFAULT 'normal',
+      status TEXT NOT NULL DEFAULT 'draft', kind TEXT NOT NULL DEFAULT 'normal',
+      summary_agent TEXT NOT NULL DEFAULT '', summary_gm TEXT NOT NULL DEFAULT '',
+      hook TEXT NOT NULL DEFAULT '', development TEXT NOT NULL DEFAULT '', climax TEXT NOT NULL DEFAULT '',
+      outcomes_json TEXT NOT NULL DEFAULT '[]', consequences_json TEXT NOT NULL DEFAULT '{}',
+      triggers_json TEXT NOT NULL DEFAULT '[]', entity TEXT, region_id TEXT, triggered_by TEXT,
+      created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS mission_clues (
+      id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, text TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'evidencia',
+      reveals TEXT, reveals_mission_id TEXT, visibility TEXT NOT NULL DEFAULT 'publico',
+      unlocked_by_clue_id TEXT, found INTEGER NOT NULL DEFAULT 0, order_idx INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY(mission_id) REFERENCES missions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS vote_rounds (
+      round INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL DEFAULT 'voting',
+      mission_ids_json TEXT NOT NULL DEFAULT '[]',
+      opened_by TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, winner_mission_id TEXT
+    );
+    CREATE TABLE IF NOT EXISTS mission_ballots (
+      round INTEGER NOT NULL, username TEXT NOT NULL, mission_id TEXT NOT NULL, created_at TEXT NOT NULL,
+      PRIMARY KEY(round, username),
+      FOREIGN KEY(round) REFERENCES vote_rounds(round) ON DELETE CASCADE
+    );
   `);
 }
 const FILE_TYPES = new Set(['nota','imagem','documento','evidencia']);
@@ -229,6 +270,382 @@ app.delete('/api/live/transmissions/:id', auth, admin, ah(async (req, res) => {
   res.json({ ok: true });
 }));
 
+function publicMissionOption(row){ return { id: row.id, round: row.round, title: row.title, type: row.type, loc: row.loc, desc: row.desc_text, clues: JSON.parse(row.clues_json||'[]'), createdBy: row.created_by, createdAt: row.created_at }; }
+async function getCurrentMissionRound(){ return await get('SELECT * FROM mission_rounds ORDER BY round DESC LIMIT 1'); }
+
+app.get('/api/missions/current', auth, ah(async (req, res) => {
+  const round = await getCurrentMissionRound();
+  if (!round) return res.json({ round: null, options: [], tally: {}, myVote: null, voters: null });
+  const options = (await all('SELECT * FROM mission_options WHERE round=? ORDER BY created_at', [round.round])).map(publicMissionOption);
+  const voteRows = await all('SELECT option_id, COUNT(*) as n FROM mission_votes WHERE round=? GROUP BY option_id', [round.round]);
+  const tally = {}; voteRows.forEach(v => { tally[v.option_id] = v.n; });
+  const myVoteRow = await get('SELECT option_id FROM mission_votes WHERE round=? AND username=?', [round.round, req.user.username]);
+  const voters = req.user.role === 'admin' ? await all('SELECT username, option_id FROM mission_votes WHERE round=?', [round.round]) : null;
+  res.json({
+    round: { number: round.round, status: round.status, openedBy: round.opened_by, openedAt: round.opened_at, closedAt: round.closed_at, winnerOptionId: round.winner_option_id },
+    options, tally, myVote: myVoteRow ? myVoteRow.option_id : null, voters
+  });
+}));
+
+app.post('/api/missions/round', auth, admin, ah(async (req, res) => {
+  const existing = await get("SELECT round FROM mission_rounds WHERE status='voting'");
+  if (existing) return res.status(409).json({ error: 'ROUND_ALREADY_OPEN', round: existing.round });
+  const now = new Date().toISOString();
+  const result = await run('INSERT INTO mission_rounds (status, opened_by, opened_at) VALUES (?, ?, ?)', ['voting', req.user.username, now]);
+  const roundNumber = Number(result.lastInsertRowid);
+  await logAudit(req.user.username, 'abrir_votacao_missao', 'rodada '+roundNumber);
+  broadcastLive('mission_round_opened', { round: roundNumber });
+  res.status(201).json({ round: roundNumber });
+}));
+
+app.post('/api/missions/round/:round/options', auth, admin, ah(async (req, res) => {
+  const round = await get('SELECT * FROM mission_rounds WHERE round=?', [req.params.round]);
+  if (!round || round.status !== 'voting') return res.status(400).json({ error: 'ROUND_NOT_OPEN' });
+  const now = new Date().toISOString();
+  const option = {
+    id: 'opt-'+crypto.randomBytes(8).toString('hex'), round: round.round,
+    title: String(req.body.title || '').slice(0, 200) || 'MISSÃO SEM TÍTULO',
+    type: String(req.body.type || '').slice(0, 60), loc: String(req.body.loc || '').slice(0, 60),
+    desc_text: String(req.body.desc || '').slice(0, 4000),
+    clues_json: JSON.stringify(Array.isArray(req.body.clues) ? req.body.clues.slice(0, 8).map(c => String(c).slice(0, 300)) : []),
+    created_by: req.user.username, created_at: now
+  };
+  await run('INSERT INTO mission_options VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(option));
+  broadcastLive('mission_option_added', { round: round.round });
+  res.status(201).json({ option: publicMissionOption(option) });
+}));
+
+app.delete('/api/missions/options/:id', auth, admin, ah(async (req, res) => {
+  const opt = await get('SELECT * FROM mission_options WHERE id=?', [req.params.id]);
+  if (!opt) return res.status(404).json({ error: 'NOT_FOUND' });
+  await run('DELETE FROM mission_options WHERE id=?', [req.params.id]);
+  await run('DELETE FROM mission_votes WHERE option_id=?', [req.params.id]);
+  broadcastLive('mission_option_removed', { round: opt.round });
+  res.json({ ok: true });
+}));
+
+app.post('/api/missions/round/:round/vote', auth, ah(async (req, res) => {
+  const round = await get('SELECT * FROM mission_rounds WHERE round=?', [req.params.round]);
+  if (!round || round.status !== 'voting') return res.status(400).json({ error: 'ROUND_NOT_OPEN' });
+  const option = await get('SELECT * FROM mission_options WHERE id=? AND round=?', [req.body.optionId, round.round]);
+  if (!option) return res.status(400).json({ error: 'OPTION_NOT_FOUND' });
+  const now = new Date().toISOString();
+  await run('INSERT INTO mission_votes VALUES (?, ?, ?, ?) ON CONFLICT(round,username) DO UPDATE SET option_id=excluded.option_id, created_at=excluded.created_at', [round.round, req.user.username, option.id, now]);
+  broadcastLive('mission_vote_cast', { round: round.round });
+  res.json({ ok: true });
+}));
+
+app.post('/api/missions/round/:round/close', auth, admin, ah(async (req, res) => {
+  const round = await get('SELECT * FROM mission_rounds WHERE round=?', [req.params.round]);
+  if (!round || round.status !== 'voting') return res.status(400).json({ error: 'ROUND_NOT_OPEN' });
+  const tallyRows = await all(
+    `SELECT v.option_id, COUNT(*) as n, MIN(o.created_at) as oc
+     FROM mission_votes v JOIN mission_options o ON o.id=v.option_id
+     WHERE v.round=? GROUP BY v.option_id ORDER BY n DESC, oc ASC`, [round.round]);
+  const winnerOptionId = tallyRows.length ? tallyRows[0].option_id : null;
+  const now = new Date().toISOString();
+  await run('UPDATE mission_rounds SET status=?, closed_at=?, winner_option_id=? WHERE round=?', ['closed', now, winnerOptionId, round.round]);
+  await logAudit(req.user.username, 'fechar_votacao_missao', 'rodada '+round.round);
+  broadcastLive('mission_round_closed', { round: round.round, winnerOptionId });
+  res.json({ ok: true, winnerOptionId });
+}));
+
+/* ============================================================================
+   MISSÕES — sistema completo (Fase 1). Cada missão tem duas camadas: o que o
+   agente vê (sem spoiler) e a Visão do Mestre (o que realmente acontece,
+   desfechos, gatilhos). Pistas têm categoria e podem ser públicas ou secretas.
+   O gerador olha pro estado da cidade (caos/criminalidade) que o cliente manda,
+   e escreve uma situação narrativa de verdade, não só um título aleatório.
+   ============================================================================ */
+function publicMission(row, isAdmin){
+  const base = {
+    id: row.id, code: row.code, level: row.level, title: row.title, type: row.type, loc: row.loc,
+    priority: row.priority, status: row.status, kind: row.kind,
+    summaryAgent: row.summary_agent, entity: row.entity, regionId: row.region_id,
+    createdAt: row.created_at, updatedAt: row.updated_at
+  };
+  if (isAdmin){
+    base.summaryGm = row.summary_gm; base.hook = row.hook; base.development = row.development; base.climax = row.climax;
+    base.outcomes = JSON.parse(row.outcomes_json||'[]'); base.consequences = JSON.parse(row.consequences_json||'{}');
+    base.triggers = JSON.parse(row.triggers_json||'[]'); base.createdBy = row.created_by; base.triggeredBy = row.triggered_by;
+  }
+  return base;
+}
+function publicClue(row, isAdmin){
+  if (row.visibility==='secreto' && !isAdmin) return null;
+  return { id: row.id, missionId: row.mission_id, text: row.text, category: row.category,
+    reveals: row.reveals, revealsMissionId: row.reveals_mission_id, visibility: row.visibility,
+    unlockedByClueId: row.unlocked_by_clue_id, found: !!row.found, order: row.order_idx };
+}
+async function missionWithClues(id, isAdmin){
+  const row = await get('SELECT * FROM missions WHERE id=?', [id]);
+  if (!row) return null;
+  const m = publicMission(row, isAdmin);
+  const clueRows = await all('SELECT * FROM mission_clues WHERE mission_id=? ORDER BY order_idx', [id]);
+  m.clues = clueRows.map(c => publicClue(c, isAdmin)).filter(Boolean);
+  return m;
+}
+
+const MISSION_TYPES = ['Assassinato','Desaparecimento','Anomalia','Culto','Sabotagem','Experimento','Contrabando','Criatura','Corrupção','Sequestro','Sinal','Lugar impossível'];
+const MISSION_LOC = ['Old City','New City','Metrô','Porto','Zona Industrial','Distrito Comercial','Hospital','Universidade','Complexo Corporativo','Subterrâneo','Bairro Residencial','Cemitério'];
+const MISSION_ENTITIES = ['O Vazio','A Carne','O Sinal','A Máscara','O Abismo'];
+const MISSION_CLUE_CATEGORIES = ['evidencia_fisica','testemunho','documento','gravacao','comportamento','ambiental','conexao','falsa'];
+const MISSION_CLUE_TEMPLATES = [
+  'Um objeto no local tem a mesma marca de outro incidente arquivado.',
+  'Uma testemunha jura ter visto a mesma pessoa em dois lugares ao mesmo tempo.',
+  'Os registros oficiais do horário do incidente foram alterados.',
+  'Um som/cheiro fora do comum é relatado por mais de uma pessoa.',
+  'Um documento cita um nome que não deveria estar naquele arquivo.',
+  'Uma gravação contém uma resposta a uma pergunta que ninguém fez em voz alta.',
+  'Um símbolo repetido aparece em um ponto que não faz sentido geograficamente.',
+  'Um dos envolvidos mudou de comportamento dias antes do incidente.',
+  'Uma câmera mostra alguém entrando, mas nunca saindo do local.',
+  'Um relatório antigo da L.O.B. menciona algo muito parecido.',
+  'Uma linha telefônica encontrada no local não pertence a ninguém registrado.',
+  'Os relógios do local pararam todos no mesmo horário exato.',
+  'Um cheiro ou resíduo químico não combina com a explicação oficial.',
+  'Uma pessoa relacionada ao caso desapareceu dos registros públicos.',
+  'Uma marca no chão/parede sugere que algo foi arrastado dali.'
+];
+const MISSION_WORD1=['The','A','No','Last','Black','Hollow','Dead','Silent','Broken','Forgotten','Ashen','Empty','False','Cold','Red'];
+const MISSION_WORD2=['Grave','Signal','House','Passenger','Room','Door','Witness','Choir','Archive','Child','Station','Floor','Market','Face','Path','Harbor'];
+
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+function pickN(arr, n){ const copy=arr.slice(); const out=[]; for(let i=0;i<n&&copy.length;i++) out.push(copy.splice(Math.floor(Math.random()*copy.length),1)[0]); return out; }
+
+function weightedMissionType(city){
+  const crime = Math.max(0, Math.min(100, Number(city&&city.crime)||0));
+  const chaos = Math.max(0, Math.min(100, Number(city&&city.chaos)||0));
+  const pool = [];
+  MISSION_TYPES.forEach(t=>{
+    let weight = 3;
+    if (['Assassinato','Contrabando','Corrupção','Sequestro'].includes(t)) weight += Math.round(crime/20);
+    if (['Anomalia','Criatura','Lugar impossível','Sinal'].includes(t)) weight += Math.round(chaos/20);
+    for (let i=0;i<weight;i++) pool.push(t);
+  });
+  return pick(pool);
+}
+function generateOneMission({ level, city }){
+  const type = weightedMissionType(city);
+  const loc = pick(MISSION_LOC);
+  const entity = pick(MISSION_ENTITIES);
+  const chaos = Math.max(0, Math.min(100, Number(city&&city.chaos)||0));
+  const code = 'K-'+String(100+Math.floor(Math.random()*900));
+  const title = pick(MISSION_WORD1)+' '+pick(MISSION_WORD2);
+  const summaryAgent = `Um caso de ${type.toLowerCase()} é reportado em ${loc}. A L.O.B. recebeu autorização para investigar.`;
+  const hook = `A L.O.B. recebe um chamado sobre ${type.toLowerCase()} em ${loc}. `+pick([
+    'Um funcionário local aciona a linha de emergência.', 'Uma denúncia anônima chega ao escritório.',
+    'Um agente de campo relata algo fora do padrão.', 'Um relatório policial é encaminhado à L.O.B. por engano.'
+  ]);
+  const development = 'Os agentes encontram sinais de que o caso começou antes do relatado. '+pick([
+    'Testemunhas dão versões contraditórias.', 'Parte dos registros foi apagada.',
+    'Um segundo grupo parece interessado no mesmo local.', 'A cena não bate com a descrição inicial.'
+  ])+' Conforme investigam, a situação se mostra maior do que parecia.';
+  const climax = pick([
+    `A causa real não é humana — há sinais de influência de ${entity}.`,
+    'O verdadeiro responsável está mais próximo da L.O.B. do que imaginavam.',
+    'O incidente é só um sintoma de algo maior ainda não resolvido.',
+    'O local esconde uma passagem ou estrutura que não deveria existir.'
+  ]);
+  const summaryGm = 'O QUE REALMENTE ESTÁ ACONTECENDO: '+climax+' Os agentes podem descobrir isso investigando as pistas ligadas ao caso.';
+  const outcomes = [
+    { label:'Final A', text:'Os agentes resolvem o caso e contêm a situação.' },
+    { label:'Final B', text:'O caso é contido, mas com um custo ou consequência lateral.' },
+    { label:'Final C', text:'A equipe falha e o caso se transforma em algo maior.' }
+  ];
+  const consequences = {
+    completed: { chaos:-4, crime:-3, entity:0, lob:2 },
+    ignored: { chaos:2, crime:3, entity:2, lob:0 },
+    failed: { chaos:6, crime:6, entity:5, lob:-2 }
+  };
+  const clueCount = 3 + Math.floor(Math.random()*4);
+  const clueTexts = pickN(MISSION_CLUE_TEMPLATES, clueCount);
+  const clues = clueTexts.map((text, i) => ({
+    text, category: pick(MISSION_CLUE_CATEGORIES),
+    reveals: i===clueCount-1 ? `Conexão com outro caso ligado a ${entity}.` : null,
+    visibility: i>=clueCount-2 ? 'secreto' : 'publico'
+  }));
+  return { code, title, type, loc, priority: chaos>=60?'alta':'normal', kind:'normal', entity, summaryAgent, summaryGm, hook, development, climax, outcomes, consequences, clues };
+}
+
+app.get('/api/missions', auth, ah(async (req, res) => {
+  const isAdmin = req.user.role==='admin';
+  let sql = 'SELECT * FROM missions WHERE 1=1'; const args = [];
+  if (req.query.level){ sql += ' AND level=?'; args.push(Number(req.query.level)); }
+  if (req.query.status){ sql += ' AND status=?'; args.push(req.query.status); }
+  if (!isAdmin) sql += " AND status!='draft'";
+  sql += ' ORDER BY created_at DESC';
+  const rows = await all(sql, args);
+  const missions = [];
+  for (const row of rows) missions.push(await missionWithClues(row.id, isAdmin));
+  res.json({ missions });
+}));
+
+app.post('/api/missions', auth, admin, ah(async (req, res) => {
+  const now = new Date().toISOString();
+  const id = 'mis-'+crypto.randomBytes(8).toString('hex');
+  const row = {
+    id, code: req.body.code || null, level: Number(req.body.level)||1,
+    title: String(req.body.title||'SEM TÍTULO').slice(0,200), type: req.body.type||null, loc: req.body.loc||null,
+    priority: req.body.priority||'normal', status: req.body.status||'draft', kind: req.body.kind||'normal',
+    summary_agent: String(req.body.summaryAgent||'').slice(0,2000), summary_gm: String(req.body.summaryGm||'').slice(0,4000),
+    hook: String(req.body.hook||'').slice(0,2000), development: String(req.body.development||'').slice(0,3000), climax: String(req.body.climax||'').slice(0,2000),
+    outcomes_json: JSON.stringify(req.body.outcomes||[]), consequences_json: JSON.stringify(req.body.consequences||{}),
+    triggers_json: JSON.stringify(req.body.triggers||[]), entity: req.body.entity||null, region_id: req.body.regionId||null,
+    triggered_by: req.body.triggeredBy||null, created_by: req.user.username, created_at: now, updated_at: now
+  };
+  await run('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(row));
+  if (Array.isArray(req.body.clues)){
+    for (let i=0;i<req.body.clues.length;i++){
+      const c = req.body.clues[i];
+      await run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+        'clue-'+crypto.randomBytes(6).toString('hex'), id, String(c.text||'').slice(0,500), c.category||'evidencia',
+        c.reveals||null, c.revealsMissionId||null, c.visibility==='secreto'?'secreto':'publico', c.unlockedByClueId||null, 0, i
+      ]);
+    }
+  }
+  await logAudit(req.user.username, 'criar_missao', row.title);
+  res.status(201).json({ mission: await missionWithClues(id, true) });
+}));
+
+app.post('/api/missions/generate', auth, admin, ah(async (req, res) => {
+  const count = Math.max(1, Math.min(5, Number(req.body.count)||1));
+  const level = Number(req.body.level)||1;
+  const city = req.body.city || {};
+  const now = new Date().toISOString();
+  const created = [];
+  for (let i=0;i<count;i++){
+    const draft = generateOneMission({ level, city });
+    const id = 'mis-'+crypto.randomBytes(8).toString('hex');
+    const row = {
+      id, code: draft.code, level, title: draft.title, type: draft.type, loc: draft.loc,
+      priority: draft.priority, status: 'draft', kind: draft.kind,
+      summary_agent: draft.summaryAgent, summary_gm: draft.summaryGm, hook: draft.hook, development: draft.development, climax: draft.climax,
+      outcomes_json: JSON.stringify(draft.outcomes), consequences_json: JSON.stringify(draft.consequences), triggers_json: '[]',
+      entity: draft.entity, region_id: null, triggered_by: null,
+      created_by: req.user.username, created_at: now, updated_at: now
+    };
+    await run('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(row));
+    for (let ci=0; ci<draft.clues.length; ci++){
+      const c = draft.clues[ci];
+      await run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+        'clue-'+crypto.randomBytes(6).toString('hex'), id, c.text, c.category, c.reveals||null, null, c.visibility, null, 0, ci
+      ]);
+    }
+    created.push(await missionWithClues(id, true));
+  }
+  await logAudit(req.user.username, 'gerar_missoes', count+' missão(ões), nível '+level);
+  res.json({ missions: created });
+}));
+
+app.put('/api/missions/:id', auth, admin, ah(async (req, res) => {
+  const existing = await get('SELECT * FROM missions WHERE id=?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'NOT_FOUND' });
+  const colMap = { code:'code', level:'level', title:'title', type:'type', loc:'loc', priority:'priority', status:'status', kind:'kind', summaryAgent:'summary_agent', summaryGm:'summary_gm', hook:'hook', development:'development', climax:'climax', entity:'entity', regionId:'region_id' };
+  const sets = [], args = [];
+  Object.keys(colMap).forEach(f => { if (req.body[f]!==undefined){ sets.push(colMap[f]+'=?'); args.push(f==='level' ? Number(req.body[f]) : req.body[f]); } });
+  if (req.body.outcomes!==undefined){ sets.push('outcomes_json=?'); args.push(JSON.stringify(req.body.outcomes)); }
+  if (req.body.consequences!==undefined){ sets.push('consequences_json=?'); args.push(JSON.stringify(req.body.consequences)); }
+  if (req.body.triggers!==undefined){ sets.push('triggers_json=?'); args.push(JSON.stringify(req.body.triggers)); }
+  sets.push('updated_at=?'); args.push(new Date().toISOString());
+  args.push(req.params.id);
+  if (sets.length>1) await run('UPDATE missions SET '+sets.join(', ')+' WHERE id=?', args);
+  await logAudit(req.user.username, 'editar_missao', existing.title);
+  res.json({ mission: await missionWithClues(req.params.id, true) });
+}));
+
+app.delete('/api/missions/:id', auth, admin, ah(async (req, res) => {
+  const existing = await get('SELECT * FROM missions WHERE id=?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'NOT_FOUND' });
+  await run('DELETE FROM missions WHERE id=?', [req.params.id]);
+  await run('DELETE FROM mission_clues WHERE mission_id=?', [req.params.id]);
+  await logAudit(req.user.username, 'excluir_missao', existing.title);
+  res.json({ ok: true });
+}));
+
+app.post('/api/missions/:id/clues', auth, admin, ah(async (req, res) => {
+  const mission = await get('SELECT id FROM missions WHERE id=?', [req.params.id]);
+  if (!mission) return res.status(404).json({ error: 'MISSION_NOT_FOUND' });
+  const countRow = await get('SELECT COUNT(*) as n FROM mission_clues WHERE mission_id=?', [req.params.id]);
+  const clue = {
+    id: 'clue-'+crypto.randomBytes(6).toString('hex'), mission_id: req.params.id,
+    text: String(req.body.text||'').slice(0,500), category: req.body.category||'evidencia',
+    reveals: req.body.reveals||null, reveals_mission_id: req.body.revealsMissionId||null,
+    visibility: req.body.visibility==='secreto'?'secreto':'publico',
+    unlocked_by_clue_id: req.body.unlockedByClueId||null, found: 0, order_idx: countRow ? countRow.n : 0
+  };
+  await run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(clue));
+  res.status(201).json({ clue: publicClue(clue, true) });
+}));
+app.put('/api/missions/clues/:id', auth, admin, ah(async (req, res) => {
+  const existing = await get('SELECT * FROM mission_clues WHERE id=?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'NOT_FOUND' });
+  const text = req.body.text!==undefined ? String(req.body.text).slice(0,500) : existing.text;
+  const category = req.body.category!==undefined ? req.body.category : existing.category;
+  const reveals = req.body.reveals!==undefined ? req.body.reveals : existing.reveals;
+  const visibility = req.body.visibility!==undefined ? (req.body.visibility==='secreto'?'secreto':'publico') : existing.visibility;
+  const found = req.body.found!==undefined ? (req.body.found?1:0) : existing.found;
+  await run('UPDATE mission_clues SET text=?, category=?, reveals=?, visibility=?, found=? WHERE id=?', [text, category, reveals, visibility, found, req.params.id]);
+  res.json({ clue: publicClue(await get('SELECT * FROM mission_clues WHERE id=?', [req.params.id]), true) });
+}));
+app.delete('/api/missions/clues/:id', auth, admin, ah(async (req, res) => {
+  await run('DELETE FROM mission_clues WHERE id=?', [req.params.id]);
+  res.json({ ok: true });
+}));
+
+app.get('/api/missions/rounds/current', auth, ah(async (req, res) => {
+  const round = await get('SELECT * FROM vote_rounds ORDER BY round DESC LIMIT 1');
+  if (!round) return res.json({ round: null, missions: [], tally: {}, myVote: null, voters: null });
+  const isAdmin = req.user.role==='admin';
+  const missionIds = JSON.parse(round.mission_ids_json||'[]');
+  const missions = [];
+  for (const mid of missionIds){ const m = await missionWithClues(mid, isAdmin); if (m) missions.push(m); }
+  const voteRows = await all('SELECT mission_id, COUNT(*) as n FROM mission_ballots WHERE round=? GROUP BY mission_id', [round.round]);
+  const tally = {}; voteRows.forEach(v => { tally[v.mission_id] = v.n; });
+  const myVoteRow = await get('SELECT mission_id FROM mission_ballots WHERE round=? AND username=?', [round.round, req.user.username]);
+  const voters = isAdmin ? await all('SELECT username, mission_id FROM mission_ballots WHERE round=?', [round.round]) : null;
+  res.json({
+    round: { number: round.round, status: round.status, openedBy: round.opened_by, openedAt: round.opened_at, closedAt: round.closed_at, winnerMissionId: round.winner_mission_id },
+    missions, tally, myVote: myVoteRow ? myVoteRow.mission_id : null, voters
+  });
+}));
+app.post('/api/missions/rounds', auth, admin, ah(async (req, res) => {
+  const existing = await get("SELECT round FROM vote_rounds WHERE status='voting'");
+  if (existing) return res.status(409).json({ error: 'ROUND_ALREADY_OPEN', round: existing.round });
+  const missionIds = Array.isArray(req.body.missionIds) ? req.body.missionIds : [];
+  if (!missionIds.length) return res.status(400).json({ error: 'NO_MISSIONS_SELECTED' });
+  const now = new Date().toISOString();
+  const result = await run('INSERT INTO vote_rounds (status, mission_ids_json, opened_by, opened_at) VALUES (?, ?, ?, ?)', ['voting', JSON.stringify(missionIds), req.user.username, now]);
+  const roundNumber = Number(result.lastInsertRowid);
+  for (const mid of missionIds) await run("UPDATE missions SET status='voting', updated_at=? WHERE id=?", [now, mid]);
+  await logAudit(req.user.username, 'abrir_votacao_missao', 'rodada '+roundNumber);
+  broadcastLive('mission_round_opened', { round: roundNumber });
+  res.status(201).json({ round: roundNumber });
+}));
+app.post('/api/missions/rounds/:round/vote', auth, ah(async (req, res) => {
+  const round = await get('SELECT * FROM vote_rounds WHERE round=?', [req.params.round]);
+  if (!round || round.status!=='voting') return res.status(400).json({ error: 'ROUND_NOT_OPEN' });
+  const missionIds = JSON.parse(round.mission_ids_json||'[]');
+  if (!missionIds.includes(req.body.missionId)) return res.status(400).json({ error: 'MISSION_NOT_IN_ROUND' });
+  const now = new Date().toISOString();
+  await run('INSERT INTO mission_ballots VALUES (?, ?, ?, ?) ON CONFLICT(round,username) DO UPDATE SET mission_id=excluded.mission_id, created_at=excluded.created_at', [round.round, req.user.username, req.body.missionId, now]);
+  broadcastLive('mission_vote_cast', { round: round.round });
+  res.json({ ok: true });
+}));
+app.post('/api/missions/rounds/:round/close', auth, admin, ah(async (req, res) => {
+  const round = await get('SELECT * FROM vote_rounds WHERE round=?', [req.params.round]);
+  if (!round || round.status!=='voting') return res.status(400).json({ error: 'ROUND_NOT_OPEN' });
+  const missionIds = JSON.parse(round.mission_ids_json||'[]');
+  const tallyRows = await all('SELECT mission_id, COUNT(*) as n, MIN(created_at) as oc FROM mission_ballots WHERE round=? GROUP BY mission_id ORDER BY n DESC, oc ASC', [round.round]);
+  const winnerMissionId = tallyRows.length ? tallyRows[0].mission_id : missionIds[0];
+  const now = new Date().toISOString();
+  await run('UPDATE vote_rounds SET status=?, closed_at=?, winner_mission_id=? WHERE round=?', ['closed', now, winnerMissionId, round.round]);
+  for (const mid of missionIds) await run('UPDATE missions SET status=?, updated_at=? WHERE id=?', [mid===winnerMissionId ? 'active' : 'ignored', now, mid]);
+  await logAudit(req.user.username, 'fechar_votacao_missao', 'rodada '+round.round);
+  broadcastLive('mission_round_closed', { round: round.round, winnerMissionId });
+  res.json({ ok: true, winnerMissionId });
+}));
+
 app.get('/api/users', auth, admin, ah(async (_req, res) => res.json({ users: (await all('SELECT * FROM users ORDER BY username')).map(publicUser) })));
 app.post('/api/users', auth, admin, ah(async (req, res) => {
   const username = String(req.body.username || '').trim().toLowerCase();
@@ -335,10 +752,13 @@ app.get('/api/admin/backup', auth, admin, ah(async (req, res) => {
   const events = await all('SELECT * FROM live_events');
   const transmissions = await all('SELECT * FROM live_transmissions');
   const states = await all('SELECT * FROM city_states');
+  const missionRounds = await all('SELECT * FROM mission_rounds ORDER BY round');
+  const missionOptions = (await all('SELECT * FROM mission_options')).map(publicMissionOption);
+  const missionVotes = await all('SELECT * FROM mission_votes');
   res.json({
-    exportedAt: new Date().toISOString(), version: 2, service: 'karsk-backend',
+    exportedAt: new Date().toISOString(), version: 3, service: 'karsk-backend',
     shared: records.map(r => ({ key: r.record_key, value: JSON.parse(r.value_json), updatedAt: r.updated_at })),
-    users, agentFiles, auditLog, events, transmissions, states
+    users, agentFiles, auditLog, events, transmissions, states, missionRounds, missionOptions, missionVotes
   });
 }));
 

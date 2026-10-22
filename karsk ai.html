@@ -1115,7 +1115,7 @@ body.crt-high #crt-flicker{animation:crt-flicker-anim 6s infinite;}
     <div id="live-panel">
       <div class="live-shell">
         <div class="live-head"><span>L.O.B. // LIVE CITY CONTROL</span><button class="live-close" id="live-close">FECHAR</button></div>
-        <div class="live-tabs"><button class="live-tab active" data-live-tab="agents">AGENTES</button><button class="live-tab" data-live-tab="radio">RÁDIO</button><button class="live-tab" data-live-tab="events">EVENTOS</button><button class="live-tab" data-live-tab="timeline">TIMELINE</button><button class="live-tab" data-live-tab="state">STATE</button></div>
+        <div class="live-tabs"><button class="live-tab active" data-live-tab="agents">AGENTES</button><button class="live-tab" data-live-tab="radio">RÁDIO</button><button class="live-tab" data-live-tab="events">EVENTOS</button><button class="live-tab" data-live-tab="missions">MISSÕES</button><button class="live-tab" data-live-tab="timeline">TIMELINE</button><button class="live-tab" data-live-tab="state">STATE</button></div>
         <div class="live-body" id="live-body"></div>
       </div>
     </div>
@@ -1756,7 +1756,7 @@ const ARCHIVE_STORE_KEY = 'karsk:mission-archive';
 let NEWS_ITEMS = [];
 let MISSION_ARCHIVE = [];
 const LIVE_KEYS = {presence:'karsk:live:presence',events:'karsk:live:events',transmissions:'karsk:live:transmissions',states:'karsk:live:states'};
-const LIVE_STATE = {presence:[],events:[],transmissions:[],states:[],activeState:null,activeTab:'agents',pollHandle:null,presenceHandle:null,eventSource:null};
+const LIVE_STATE = {presence:[],events:[],transmissions:[],states:[],activeState:null,activeTab:'agents',pollHandle:null,presenceHandle:null,eventSource:null,missionRound:null,roundMissions:[],missionTally:{},myMissionVote:null,missionVoters:null,missions:[],missionLevel:1,missionSelection:new Set(),activeMission:null};
 function liveText(value){ return escapeHTML(value == null ? '' : value); }
 function liveNow(){ return new Date().toISOString(); }
 async function loadLiveLocal(){
@@ -1818,6 +1818,23 @@ async function pollNewsUpdates(){
   if (typeof renderNewsPanel === 'function') renderNewsPanel();
   return fresh;
 }
+async function pollMissionUpdates(){
+  if (!ONLINE_API_BASE) return [];
+  await refreshMissionRound();
+  await refreshMissionList();
+  const round = LIVE_STATE.missionRound;
+  if (!round) return [];
+  const fresh = [];
+  const openKey = 'missionround-open:'+round.number;
+  const closeKey = 'missionround-close:'+round.number;
+  if (round.status==='voting' && !SEEN_LIVE_IDS.has(openKey)){ SEEN_LIVE_IDS.add(openKey); fresh.push({kind:'mission_round', item:{title:'Votação de missão #'+round.number+' está aberta.'}}); }
+  if (round.status==='closed' && !SEEN_LIVE_IDS.has(closeKey)){
+    SEEN_LIVE_IDS.add(closeKey);
+    const winner = LIVE_STATE.roundMissions.find(m=>m.id===round.winnerMissionId);
+    fresh.push({kind:'mission_result', item:{title: winner ? winner.title : 'Votação encerrada sem votos.'}});
+  }
+  return fresh;
+}
 async function refreshLive(){
   if (ONLINE_API_BASE){ try{ const data=await onlineRequest('/live/snapshot'); Object.assign(LIVE_STATE,{presence:data.presence||[],events:data.events||[],transmissions:data.transmissions||[],states:data.states||[]}); LIVE_STATE.activeState=LIVE_STATE.states.find(state=>state.active)||LIVE_STATE.states[0]||null; }catch(e){} }
   else await loadLiveLocal();
@@ -1827,17 +1844,18 @@ async function refreshLive(){
   LIVE_STATE.transmissions.forEach(tx=>{ const key='tx:'+tx.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'transmission', item:tx}); } });
   freshlyNew.push(...await pollSharedFilesFeed());
   freshlyNew.push(...await pollNewsUpdates());
+  freshlyNew.push(...await pollMissionUpdates());
   renderLivePanel(); renderMarkers(); updateLiveHud();
   if (freshlyNew.length){
     persistSeenLiveIds();
-    freshlyNew.forEach(entry=> UNREAD_LIVE_IDS.add(entry.kind+':'+entry.item.id));
+    freshlyNew.forEach(entry=> UNREAD_LIVE_IDS.add(entry.kind+':'+(entry.item.id||entry.item.title)));
     persistUnreadLiveIds();
     updateLiveBadge();
     if (!seenLiveIsFreshBootstrap){
       playAudio('live_alert');
       const first = freshlyNew[0];
-      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]', news:'[ NOVA NOTÍCIA ]'};
-      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"', news: first.item.title||'Nova notícia publicada.'};
+      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]', news:'[ NOVA NOTÍCIA ]', mission_round:'[ VOTAÇÃO ABERTA ]', mission_result:'[ MISSÃO ESCOLHIDA ]'};
+      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"', news: first.item.title||'Nova notícia publicada.', mission_round: first.item.title, mission_result: first.item.title};
       const heading = headingFor[first.kind];
       const label = freshlyNew.length>1 ? freshlyNew.length+' novos registros disponíveis' : labelFor[first.kind];
       showDiscoveryToast(heading, label);
@@ -1881,13 +1899,271 @@ function renderLivePanel(){
     html+=LIVE_STATE.presence.length?LIVE_STATE.presence.map(item=>'<div class="live-row"><strong>'+liveText(item.displayName||item.agentId||item.userId)+'</strong><span>'+liveText(item.status)+'<br>LOCAL: '+liveText(item.locationId||item.districtId||item.regionId||'CENTRAL')+'</span><span class="live-meta">'+(item.online?'ONLINE':'OFFLINE')+'</span></div>').join(''):'<div class="live-empty">NENHUM AGENTE REGISTRADO</div>';
   } else if (LIVE_STATE.activeTab==='radio') html+=LIVE_STATE.transmissions.length?LIVE_STATE.transmissions.map(item=>'<div class="live-row"><span class="live-meta">['+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+']</span><span><strong>'+liveText(item.sender)+'</strong><br>'+liveText(item.body)+'</span><span class="live-meta '+(item.urgent?'live-warn':'')+'">'+liveText(item.type)+'<br>'+liveText(item.interference)+(STATE.role==='admin'?'<br><button class="live-del-btn" data-del-transmission="'+liveText(item.id)+'">EXCLUIR</button>':'')+'</span></div>').join(''):'<div class="live-empty">NENHUMA TRANSMISSÃO</div>';
   else if (LIVE_STATE.activeTab==='events'){ const eventList = STATE.role==='admin' ? LIVE_STATE.events : active; html+=eventList.length?eventList.map(event=>'<div class="live-row"><span class="live-meta">'+liveText(event.type)+(event.active===0?'<br>(inativo)':'')+'</span><span><strong>'+liveText(event.title)+'</strong><br>'+liveText(event.description)+'</span><span class="live-meta '+(['HIGH','CRITICAL'].includes(event.severity)?'live-warn':'')+'">'+liveText(event.severity)+'<br>CHAOS '+Number(event.chaos_delta||0)+(STATE.role==='admin'?'<br><button class="live-del-btn" data-del-event="'+liveText(event.id)+'">EXCLUIR</button>':'')+'</span></div>').join(''):'<div class="live-empty">NENHUM EVENTO ATIVO</div>'; }
+  else if (LIVE_STATE.activeTab==='missions') html+=renderMissionsTabHTML();
   else if (LIVE_STATE.activeTab==='timeline') html+=LIVE_STATE.events.concat(LIVE_STATE.transmissions).sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0)).map(item=>'<div class="live-row"><span class="live-meta">'+new Date(item.created_at||Date.now()).toLocaleTimeString('pt-BR')+'</span><span><strong>'+liveText(item.title||item.sender||item.type)+'</strong><br>'+liveText(item.description||item.body||'')+'</span><span class="live-meta">'+liveText(item.type||'RADIO')+'</span></div>').join('')||'<div class="live-empty">LOG VAZIO</div>';
   else { const state=LIVE_STATE.activeState; html+='<div class="live-meta">KARSK · '+new Date().toLocaleTimeString('pt-BR')+'</div><div class="live-empty"><strong>'+liveText(state?state.name:'PRESENTE')+'</strong><br>'+liveText(state?state.description:'ESTADO OPERACIONAL ATUAL')+'<br><br>EVENTOS ATIVOS: '+active.length+'<br>AGENTES ONLINE: '+LIVE_STATE.presence.filter(item=>item.online).length+'<br>CAOS: '+Math.round(STATE.chaos)+'%</div>'; }
   body.innerHTML=html;
   body.querySelectorAll('[data-live-create]').forEach(button=>button.addEventListener('click',()=>createLiveRecord(button.dataset.liveCreate)));
   body.querySelectorAll('[data-del-event]').forEach(button=>button.addEventListener('click',(ev)=>{ ev.stopPropagation(); deleteLiveRecord('event', button.dataset.delEvent); }));
   body.querySelectorAll('[data-del-transmission]').forEach(button=>button.addEventListener('click',(ev)=>{ ev.stopPropagation(); deleteLiveRecord('transmission', button.dataset.delTransmission); }));
+  wireMissionsTabButtons(body);
 }
+
+/* ============================================================================
+   MISSÕES — votação: admin escreve as opções (com um botão de sugestão pra
+   preencher tipo/local/pista automaticamente), agentes votam uma vez cada
+   (podendo trocar o voto), admin fecha quando quiser. Tudo pelo mesmo backend
+   e pelo mesmo ciclo de refreshLive() — sem lista paralela.
+   ============================================================================ */
+const MISSION_STATUS_LABEL={draft:'RASCUNHO',voting:'EM VOTAÇÃO',active:'ATIVA',ignored:'IGNORADA',completed:'CONCLUÍDA',failed:'FRACASSADA',archived:'ARQUIVADA'};
+const MISSION_PRIORITY_LABEL={baixa:'BAIXA',normal:'NORMAL',alta:'ALTA',critica:'CRÍTICA'};
+const MISSION_CLUE_CATEGORY_LABEL={evidencia_fisica:'EVIDÊNCIA FÍSICA',testemunho:'TESTEMUNHO',documento:'DOCUMENTO',gravacao:'GRAVAÇÃO',comportamento:'COMPORTAMENTO',ambiental:'PISTA AMBIENTAL',conexao:'CONEXÃO COM OUTRO CASO',falsa:'PISTA FALSA'};
+
+async function refreshMissionList(){
+  if (!ONLINE_API_BASE || STATE.role!=='admin') return;
+  try{ const data = await onlineRequest('/missions?level='+LIVE_STATE.missionLevel); LIVE_STATE.missions = data.missions||[]; }
+  catch(e){ LIVE_STATE.missions = []; }
+}
+async function refreshMissionRound(){
+  if (!ONLINE_API_BASE) return;
+  try{
+    const data = await onlineRequest('/missions/rounds/current');
+    LIVE_STATE.missionRound = data.round;
+    LIVE_STATE.roundMissions = data.missions || [];
+    LIVE_STATE.missionTally = data.tally || {};
+    LIVE_STATE.myMissionVote = data.myVote || null;
+    LIVE_STATE.missionVoters = data.voters || null;
+  }catch(e){}
+  if (STATE.role!=='admin' && (!LIVE_STATE.missionRound || LIVE_STATE.missionRound.status!=='voting')){
+    try{ const activeData = await onlineRequest('/missions?status=active'); LIVE_STATE.activeMission = (activeData.missions||[])[0]||null; }
+    catch(e){ LIVE_STATE.activeMission = null; }
+  }
+}
+
+function missionAgentCardHTML(m, isWinner){
+  const publicClues = (m.clues||[]).filter(c=>c.visibility==='publico');
+  return '<div class="live-row" style="'+(isWinner?'border-color:var(--phosphor)':'')+'"><span><strong>'+(isWinner?'🏆 ':'')+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+
+    (publicClues.length ? '<br><br><em>Pistas:</em><br>'+publicClues.map(c=>'• '+liveText(c.text)).join('<br>') : '')+
+    '</span><span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+'</span></div>';
+}
+function missionVoteCardHTML(m, totalVotes){
+  const votes = LIVE_STATE.missionTally[m.id]||0;
+  const pct = totalVotes ? Math.round(votes/totalVotes*100) : 0;
+  const isMine = LIVE_STATE.myMissionVote===m.id;
+  let voterNames = '';
+  if (STATE.role==='admin' && LIVE_STATE.missionVoters){
+    const names = LIVE_STATE.missionVoters.filter(v=>v.mission_id===m.id).map(v=>v.username);
+    if (names.length) voterNames = '<br><span class="mut" style="font-size:9px">votaram: '+names.join(', ')+'</span>';
+  }
+  return '<div class="live-row'+(isMine?' selected':'')+'"><span><strong>'+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+voterNames+'</span>'+
+    '<span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+'<br>'+votes+' voto(s) ('+pct+'%)'+
+    '<br><button class="live-del-btn" style="background:'+(isMine?'rgba(120,180,120,.25)':'rgba(140,40,30,.25)')+'" data-mission-vote="'+liveText(m.id)+'">'+(isMine?'✓ SEU VOTO':'VOTAR')+'</button>'+
+    '</span></div>';
+}
+function missionAdminRowHTML(m){
+  const checked = LIVE_STATE.missionSelection.has(m.id);
+  return '<div class="live-row"><span><strong>'+(m.code?'['+liveText(m.code)+'] ':'')+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+'</span>'+
+    '<span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+'<br>'+MISSION_PRIORITY_LABEL[m.priority]+' · '+MISSION_STATUS_LABEL[m.status]+
+    (m.status==='draft'?'<br><label style="font-size:9px"><input type="checkbox" data-mission-select="'+liveText(m.id)+'" '+(checked?'checked':'')+'> p/ votação</label>':'')+
+    '<br><button class="live-del-btn" data-mission-expand="'+liveText(m.id)+'">ABRIR</button>'+
+    '<button class="live-del-btn" data-mission-delete="'+liveText(m.id)+'">EXCLUIR</button>'+
+    '</span></div>';
+}
+
+function renderMissionsTabHTML(){
+  if (!ONLINE_API_BASE) return '<div class="live-empty">A votação de missões precisa do backend online (parâmetro ?api=) — ela depende de coordenar votos entre agentes em tempo real.</div>';
+  let html = '';
+  const round = LIVE_STATE.missionRound;
+  if (round && round.status==='voting'){
+    const totalVotes = Object.values(LIVE_STATE.missionTally).reduce((a,b)=>a+b,0);
+    html += '<div class="live-meta">VOTAÇÃO #'+round.number+' ABERTA · '+totalVotes+' voto(s)'+(STATE.role==='admin'?' <button class="live-del-btn" data-mission-close-round="1">FECHAR VOTAÇÃO</button>':'')+'</div>';
+    html += LIVE_STATE.roundMissions.map(m=>missionVoteCardHTML(m,totalVotes)).join('');
+  } else if (round && round.status==='closed'){
+    const winner = LIVE_STATE.roundMissions.find(m=>m.id===round.winnerMissionId);
+    html += '<div class="live-meta">VOTAÇÃO #'+round.number+' ENCERRADA</div>';
+    if (winner) html += missionAgentCardHTML(winner, true);
+  } else if (STATE.role!=='admin'){
+    html += LIVE_STATE.activeMission ? ('<div class="live-meta">CASO ATIVO</div>'+missionAgentCardHTML(LIVE_STATE.activeMission,false)) : '<div class="live-empty">NENHUMA VOTAÇÃO E NENHUM CASO ATIVO NO MOMENTO.</div>';
+  }
+  if (STATE.role==='admin'){
+    html += '<div class="live-admin-actions" style="margin-top:14px">'+
+      '<select id="mission-level-select">'+Array.from({length:10},(_,i)=>'<option value="'+(i+1)+'" '+(LIVE_STATE.missionLevel===i+1?'selected':'')+'>NÍVEL '+(i+1)+'</option>').join('')+'</select>'+
+      '<button data-mission-generate="1">🎲 GERAR MISSÕES</button>'+
+      '<button data-mission-create="1">+ CRIAR MANUAL</button>'+
+      ((!round || round.status!=='voting') ? '<button data-mission-open-round="1">ABRIR VOTAÇÃO COM SELECIONADAS</button>' : '')+
+      '</div>';
+    html += '<div class="live-meta" style="margin-top:8px">MISSÕES DO NÍVEL '+LIVE_STATE.missionLevel+'</div>';
+    html += LIVE_STATE.missions.length ? LIVE_STATE.missions.map(m=>missionAdminRowHTML(m)).join('') : '<div class="live-empty">NENHUMA MISSÃO NESTE NÍVEL AINDA.</div>';
+  }
+  return html;
+}
+
+function wireMissionsTabButtons(body){
+  const levelSel = body.querySelector('#mission-level-select');
+  if (levelSel) levelSel.addEventListener('change', async ()=>{ LIVE_STATE.missionLevel = Number(levelSel.value); await refreshMissionList(); renderLivePanel(); });
+  const genBtn = body.querySelector('[data-mission-generate]');
+  if (genBtn) genBtn.addEventListener('click', async ()=>{
+    const count = Math.max(1, Math.min(5, Number(prompt('Quantas missões gerar? (1 a 5)', '3'))||3));
+    try{ await onlineRequest('/missions/generate', {method:'POST', body:JSON.stringify({count, level:LIVE_STATE.missionLevel, city:{chaos:STATE.chaos||0}})}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível gerar as missões.'); }
+    await refreshMissionList(); renderLivePanel();
+  });
+  const createBtn = body.querySelector('[data-mission-create]');
+  if (createBtn) createBtn.addEventListener('click', ()=> openMissionCreateForm());
+  const openRoundBtn = body.querySelector('[data-mission-open-round]');
+  if (openRoundBtn) openRoundBtn.addEventListener('click', async ()=>{
+    const ids = Array.from(LIVE_STATE.missionSelection);
+    if (!ids.length){ alert('Marque ao menos uma missão (checkbox "p/ votação") antes de abrir.'); return; }
+    try{ await onlineRequest('/missions/rounds', {method:'POST', body:JSON.stringify({missionIds:ids})}); playAudio('confirm'); LIVE_STATE.missionSelection.clear(); }
+    catch(e){ alert('Não foi possível abrir a votação.'); }
+    await refreshMissionRound(); await refreshMissionList(); renderLivePanel();
+  });
+  const closeRoundBtn = body.querySelector('[data-mission-close-round]');
+  if (closeRoundBtn) closeRoundBtn.addEventListener('click', async ()=>{
+    if (!window.confirm('Encerrar a votação agora? A mais votada vira a missão ativa; as outras continuam existindo como ignoradas.')) return;
+    try{ await onlineRequest('/missions/rounds/'+LIVE_STATE.missionRound.number+'/close', {method:'POST'}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível fechar a votação.'); }
+    await refreshMissionRound(); await refreshMissionList(); renderLivePanel();
+  });
+  body.querySelectorAll('[data-mission-vote]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    try{ await onlineRequest('/missions/rounds/'+LIVE_STATE.missionRound.number+'/vote', {method:'POST', body:JSON.stringify({missionId:btn.dataset.missionVote})}); playAudio('select'); }
+    catch(e){ alert('Não foi possível votar.'); }
+    await refreshMissionRound(); renderLivePanel();
+  }));
+  body.querySelectorAll('[data-mission-select]').forEach(cb=> cb.addEventListener('change', ()=>{
+    if (cb.checked) LIVE_STATE.missionSelection.add(cb.dataset.missionSelect); else LIVE_STATE.missionSelection.delete(cb.dataset.missionSelect);
+  }));
+  body.querySelectorAll('[data-mission-expand]').forEach(btn=> btn.addEventListener('click', ()=> openMissionDetailPanel(btn.dataset.missionExpand)));
+  body.querySelectorAll('[data-mission-delete]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    if (!window.confirm('Excluir esta missão permanentemente?')) return;
+    try{ await onlineRequest('/missions/'+btn.dataset.missionDelete, {method:'DELETE'}); }catch(e){}
+    await refreshMissionList(); renderLivePanel();
+  }));
+}
+
+function openMissionCreateForm(){
+  const html = '<div class="admin-form-head"><div class="afh-eyebrow">NOVA MISSÃO</div><div class="afh-title">CRIAR MANUALMENTE</div></div>'+
+    '<div class="admin-form-body">'+
+    '<div class="admin-field"><label>TÍTULO</label><input id="mc-title"></div>'+
+    '<div class="admin-field"><label>TIPO</label><input id="mc-type" placeholder="ex: Desaparecimento"></div>'+
+    '<div class="admin-field"><label>LOCAL</label><input id="mc-loc" placeholder="ex: Metrô"></div>'+
+    '<div class="admin-field"><label>NÍVEL</label><input id="mc-level" type="number" min="1" max="10" value="'+LIVE_STATE.missionLevel+'"></div>'+
+    '<div class="admin-field"><label>RESUMO PARA O AGENTE (sem spoiler)</label><textarea id="mc-summary-agent" rows="2"></textarea></div>'+
+    '<div class="admin-field"><label>VISÃO DO MESTRE (o que realmente está acontecendo)</label><textarea id="mc-summary-gm" rows="3"></textarea></div>'+
+    '<div class="admin-btn-row"><button class="admin-btn primary" id="mc-save">CRIAR</button><button class="admin-btn" id="mc-cancel">CANCELAR</button></div>'+
+    '</div>';
+  adminFormPanelEl.innerHTML = html;
+  adminFormPanelEl.classList.add('open');
+  document.getElementById('mc-cancel').addEventListener('click', closeAdminForm);
+  document.getElementById('mc-save').addEventListener('click', async ()=>{
+    const payload = {
+      title: document.getElementById('mc-title').value.trim() || 'SEM TÍTULO',
+      type: document.getElementById('mc-type').value.trim(), loc: document.getElementById('mc-loc').value.trim(),
+      level: Number(document.getElementById('mc-level').value)||1,
+      summaryAgent: document.getElementById('mc-summary-agent').value, summaryGm: document.getElementById('mc-summary-gm').value,
+      status: 'draft'
+    };
+    try{ await onlineRequest('/missions', {method:'POST', body:JSON.stringify(payload)}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível criar a missão.'); return; }
+    closeAdminForm();
+    await refreshMissionList(); renderLivePanel();
+  });
+}
+
+function consequenceRowHTML(label, key, consequences){
+  const c = (consequences && consequences[key]) || {chaos:0,crime:0,entity:0,lob:0};
+  return '<div class="mut" style="font-size:10px;margin-top:6px">'+label+' (caos / criminalidade / entidade / L.O.B.)</div>'+
+    '<div style="display:flex;gap:5px">'+['chaos','crime','entity','lob'].map(k=>'<input type="number" data-cons="'+key+':'+k+'" value="'+(c[k]||0)+'" style="width:60px">').join('')+'</div>';
+}
+function cluesListHTML(m){
+  return (m.clues||[]).map(c=>
+    '<div class="locker-row" style="padding:8px 10px;margin-bottom:6px"><div class="locker-row-head"><span>'+escapeHTML(c.text)+
+    '<div class="locker-row-meta">'+(MISSION_CLUE_CATEGORY_LABEL[c.category]||c.category)+' · '+(c.visibility==='secreto'?'🔒 SECRETA':'👁 PÚBLICA')+(c.reveals?' · revela: '+escapeHTML(c.reveals):'')+'</div></span>'+
+    '<div class="locker-row-actions"><button data-clue-toggle="'+liveText(c.id)+'">'+(c.visibility==='secreto'?'TORNAR PÚBLICA':'TORNAR SECRETA')+'</button><button data-clue-delete="'+liveText(c.id)+'">EXCLUIR</button></div>'+
+    '</div></div>'
+  ).join('') || '<div class="mut">Nenhuma pista ainda.</div>';
+}
+function openMissionDetailPanel(id){
+  const m = LIVE_STATE.missions.find(x=>x.id===id);
+  if (m) renderMissionDetailPanel(m);
+}
+function renderMissionDetailPanel(m){
+  const html = '<div class="admin-form-head"><div class="afh-eyebrow">MISSÃO'+(m.code?' ['+escapeHTML(m.code)+']':'')+' · NÍVEL '+m.level+'</div><div class="afh-title">'+escapeHTML(m.title)+'</div></div>'+
+    '<div class="admin-form-body">'+
+    '<div class="admin-field"><label>TÍTULO</label><input id="md-title" value="'+escapeHTML(m.title)+'"></div>'+
+    '<div class="admin-field"><label>TIPO</label><input id="md-type" value="'+escapeHTML(m.type||'')+'"></div>'+
+    '<div class="admin-field"><label>LOCAL</label><input id="md-loc" value="'+escapeHTML(m.loc||'')+'"></div>'+
+    '<div class="admin-field"><label>PRIORIDADE</label><select id="md-priority">'+Object.keys(MISSION_PRIORITY_LABEL).map(p=>'<option value="'+p+'" '+(m.priority===p?'selected':'')+'>'+MISSION_PRIORITY_LABEL[p]+'</option>').join('')+'</select></div>'+
+    '<div class="admin-field"><label>STATUS</label><select id="md-status">'+Object.keys(MISSION_STATUS_LABEL).map(s=>'<option value="'+s+'" '+(m.status===s?'selected':'')+'>'+MISSION_STATUS_LABEL[s]+'</option>').join('')+'</select></div>'+
+    '<div class="admin-field"><label>RESUMO PARA O AGENTE (sem spoiler)</label><textarea id="md-summary-agent" rows="3">'+escapeHTML(m.summaryAgent||'')+'</textarea></div>'+
+    '<div style="margin-top:14px;color:var(--phosphor);font-size:11px">👁 VISÃO DO MESTRE (só o admin vê)</div>'+
+    '<div class="admin-field"><label>O QUE REALMENTE ESTÁ ACONTECENDO</label><textarea id="md-summary-gm" rows="3">'+escapeHTML(m.summaryGm||'')+'</textarea></div>'+
+    '<div class="admin-field"><label>COMO A MISSÃO COMEÇA</label><textarea id="md-hook" rows="2">'+escapeHTML(m.hook||'')+'</textarea></div>'+
+    '<div class="admin-field"><label>COMO SE DESENVOLVE</label><textarea id="md-development" rows="3">'+escapeHTML(m.development||'')+'</textarea></div>'+
+    '<div class="admin-field"><label>CLÍMAX / DESCOBERTA</label><textarea id="md-climax" rows="2">'+escapeHTML(m.climax||'')+'</textarea></div>'+
+    '<div class="admin-field"><label>DESFECHOS POSSÍVEIS</label>'+(m.outcomes||[]).map(o=>'<div class="mut" style="font-size:11px;margin:3px 0"><b>'+escapeHTML(o.label)+':</b> '+escapeHTML(o.text)+'</div>').join('')+'</div>'+
+    '<div class="admin-field"><label>CONSEQUÊNCIAS</label>'+consequenceRowHTML('Se concluída','completed',m.consequences)+consequenceRowHTML('Se ignorada','ignored',m.consequences)+consequenceRowHTML('Se fracassada','failed',m.consequences)+'</div>'+
+    '<div style="margin-top:14px">PISTAS DA INVESTIGAÇÃO</div>'+
+    '<div id="md-clues">'+cluesListHTML(m)+'</div>'+
+    '<div class="admin-btn-row" style="margin-top:6px"><button class="admin-btn" id="md-add-clue">+ ADICIONAR PISTA</button></div>'+
+    '<div class="admin-btn-row" style="margin-top:18px"><button class="admin-btn primary" id="md-save">SALVAR</button><button class="admin-btn" id="md-close">FECHAR</button></div>'+
+    '</div>';
+  adminFormPanelEl.innerHTML = html;
+  adminFormPanelEl.classList.add('open');
+  wireMissionDetailPanel(m);
+}
+function wireMissionDetailPanel(m){
+  document.getElementById('md-close').addEventListener('click', closeAdminForm);
+  document.getElementById('md-save').addEventListener('click', async ()=>{
+    const consequences = {};
+    ['completed','ignored','failed'].forEach(key=>{
+      consequences[key] = {};
+      ['chaos','crime','entity','lob'].forEach(k=>{
+        const el = document.querySelector('[data-cons="'+key+':'+k+'"]');
+        consequences[key][k] = el ? Number(el.value)||0 : 0;
+      });
+    });
+    const payload = {
+      title: document.getElementById('md-title').value.trim(), type: document.getElementById('md-type').value.trim(),
+      loc: document.getElementById('md-loc').value.trim(), priority: document.getElementById('md-priority').value,
+      status: document.getElementById('md-status').value, summaryAgent: document.getElementById('md-summary-agent').value,
+      summaryGm: document.getElementById('md-summary-gm').value, hook: document.getElementById('md-hook').value,
+      development: document.getElementById('md-development').value, climax: document.getElementById('md-climax').value,
+      consequences
+    };
+    try{ await onlineRequest('/missions/'+m.id, {method:'PUT', body:JSON.stringify(payload)}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível salvar.'); return; }
+    closeAdminForm();
+    await refreshMissionList(); renderLivePanel();
+  });
+  document.getElementById('md-add-clue').addEventListener('click', async ()=>{
+    const text = prompt('Texto da pista:'); if (!text) return;
+    const category = prompt('Categoria: evidencia_fisica, testemunho, documento, gravacao, comportamento, ambiental, conexao ou falsa', 'evidencia_fisica') || 'evidencia_fisica';
+    const visibility = window.confirm('Esta pista é SECRETA (só o admin vê)? OK = secreta, Cancelar = pública.') ? 'secreto' : 'publico';
+    try{ await onlineRequest('/missions/'+m.id+'/clues', {method:'POST', body:JSON.stringify({text, category, visibility})}); }
+    catch(e){ alert('Não foi possível adicionar a pista.'); return; }
+    await refreshMissionList();
+    const updated = LIVE_STATE.missions.find(x=>x.id===m.id);
+    if (updated) renderMissionDetailPanel(updated);
+  });
+  adminFormPanelEl.querySelectorAll('[data-clue-toggle]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    const clue = (m.clues||[]).find(c=>c.id===btn.dataset.clueToggle);
+    if (!clue) return;
+    const newVis = clue.visibility==='secreto' ? 'publico' : 'secreto';
+    try{ await onlineRequest('/missions/clues/'+btn.dataset.clueToggle, {method:'PUT', body:JSON.stringify({visibility:newVis})}); }catch(e){}
+    clue.visibility = newVis;
+    renderMissionDetailPanel(m);
+  }));
+  adminFormPanelEl.querySelectorAll('[data-clue-delete]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    if (!window.confirm('Excluir esta pista?')) return;
+    try{ await onlineRequest('/missions/clues/'+btn.dataset.clueDelete, {method:'DELETE'}); }catch(e){}
+    m.clues = (m.clues||[]).filter(c=>c.id!==btn.dataset.clueDelete);
+    renderMissionDetailPanel(m);
+    await refreshMissionList();
+  }));
+}
+
+
 async function deleteLiveRecord(kind, id){
   if (STATE.role!=='admin') return;
   const label = kind==='event' ? 'este evento' : 'esta transmissão';
