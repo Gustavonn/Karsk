@@ -113,6 +113,10 @@ async function setupSchema() {
       PRIMARY KEY(round, username),
       FOREIGN KEY(round) REFERENCES vote_rounds(round) ON DELETE CASCADE
     );
+    CREATE TABLE IF NOT EXISTS campaign_state (id INTEGER PRIMARY KEY, state_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS campaign_log (id TEXT PRIMARY KEY, level INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS emergency_alerts (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, resolved_at TEXT);
+    CREATE TABLE IF NOT EXISTS mission_evolution (mission_id TEXT PRIMARY KEY, stage INTEGER NOT NULL DEFAULT 0, last_level INTEGER NOT NULL DEFAULT 1);
   `);
 }
 const FILE_TYPES = new Set(['nota','imagem','documento','evidencia']);
@@ -413,26 +417,88 @@ const MISSION_WORD2=['Grave','Signal','House','Passenger','Room','Door','Witness
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 function pickN(arr, n){ const copy=arr.slice(); const out=[]; for(let i=0;i<n&&copy.length;i++) out.push(copy.splice(Math.floor(Math.random()*copy.length),1)[0]); return out; }
 
-function weightedMissionType(city){
-  const crime = Math.max(0, Math.min(100, Number(city&&city.crime)||0));
-  const chaos = Math.max(0, Math.min(100, Number(city&&city.chaos)||0));
-  const pool = [];
-  MISSION_TYPES.forEach(t=>{
-    let weight = 3;
-    if (['Assassinato','Contrabando','Corrupção','Sequestro'].includes(t)) weight += Math.round(crime/20);
-    if (['Anomalia','Criatura','Lugar impossível','Sinal'].includes(t)) weight += Math.round(chaos/20);
-    for (let i=0;i<weight;i++) pool.push(t);
-  });
+/* ============================================================================
+   FASE 2 — campanha viva. O estado de Karsk (caos, criminalidade, anomalias,
+   conflito, controle corporativo, influência da L.O.B. e das 5 entidades) é
+   persistente no servidor. O gerador lê esse estado; concluir/fracassar uma
+   missão aplica as consequências dela; missões ignoradas evoluem a cada nível;
+   gatilhos e regras de emergência disparam sozinhos e geram alertas pro admin.
+   ============================================================================ */
+const CITY_STATS = ['chaos','crime','anomalies','conflict','corporate','lob'];
+const CRIME_TYPES = ['Assassinato','Contrabando','Corrupção','Sequestro'];
+const ANOMALY_TYPES = ['Anomalia','Criatura','Lugar impossível','Sinal'];
+const CONFLICT_TYPES = ['Sabotagem','Culto','Experimento'];
+const DEFAULT_CAMPAIGN = () => ({
+  level: 1, chaos: 0, crime: 0, anomalies: 0, conflict: 0, corporate: 0, lob: 0,
+  entities: { 'O Vazio':0, 'A Carne':0, 'O Sinal':0, 'A Máscara':0, 'O Abismo':0 },
+  emergencyFlags: {}
+});
+const clamp100 = n => Math.max(0, Math.min(100, Math.round(Number(n)||0)));
+
+async function getCampaign(){
+  const base = DEFAULT_CAMPAIGN();
+  const row = await get('SELECT state_json FROM campaign_state WHERE id=1');
+  if (!row){
+    await run('INSERT INTO campaign_state VALUES (1, ?, ?)', [JSON.stringify(base), new Date().toISOString()]);
+    return base;
+  }
+  let saved = {}; try{ saved = JSON.parse(row.state_json||'{}'); }catch(e){}
+  return Object.assign(base, saved, { entities: Object.assign(base.entities, saved.entities||{}), emergencyFlags: saved.emergencyFlags||{} });
+}
+async function saveCampaign(c){
+  await run('INSERT INTO campaign_state VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at', [JSON.stringify(c), new Date().toISOString()]);
+}
+function publicCampaign(c, isAdmin){
+  const out = { level:c.level, chaos:c.chaos, crime:c.crime, anomalies:c.anomalies, conflict:c.conflict, corporate:c.corporate, lob:c.lob };
+  if (isAdmin) out.entities = c.entities;
+  return out;
+}
+function applyDelta(c, delta, entityName){
+  if (!delta) return;
+  CITY_STATS.forEach(k => { if (delta[k]) c[k] = clamp100(c[k] + Number(delta[k])); });
+  if (delta.entity && entityName && c.entities[entityName]!==undefined) c.entities[entityName] = clamp100(c.entities[entityName] + Number(delta.entity));
+}
+async function logCampaign(level, kind, text){
+  await run('INSERT INTO campaign_log VALUES (?, ?, ?, ?, ?)', ['log-'+crypto.randomBytes(6).toString('hex'), level, kind, String(text).slice(0,600), new Date().toISOString()]);
+}
+
+function weightedPick(items, weightFn){
+  const pool = []; items.forEach(it => { const w = Math.max(1, Math.round(weightFn(it))); for (let i=0;i<w;i++) pool.push(it); });
   return pick(pool);
 }
-function generateOneMission({ level, city }){
-  const type = weightedMissionType(city);
+function weightedMissionType(c){
+  return weightedPick(MISSION_TYPES, t => {
+    let w = 3;
+    if (CRIME_TYPES.includes(t)) w += (c.crime||0)/15;
+    if (ANOMALY_TYPES.includes(t)) w += ((c.anomalies||0) + (c.chaos||0)/2)/20;
+    if (CONFLICT_TYPES.includes(t)) w += (c.conflict||0)/15;
+    if (t==='Corrupção') w += (c.corporate||0)/20;
+    return w;
+  });
+}
+function weightedEntity(c){
+  return weightedPick(MISSION_ENTITIES, name => 10 + ((c.entities && c.entities[name])||0));
+}
+function consequencesForType(type){
+  if (CRIME_TYPES.includes(type)) return {
+    completed:{ chaos:-2, crime:-6, lob:2 }, ignored:{ chaos:1, crime:4 }, failed:{ chaos:4, crime:8, entity:2, lob:-2 } };
+  if (ANOMALY_TYPES.includes(type)) return {
+    completed:{ chaos:-3, anomalies:-6, lob:2 }, ignored:{ chaos:2, anomalies:4, entity:2 }, failed:{ chaos:6, anomalies:8, entity:5, lob:-2 } };
+  return {
+    completed:{ chaos:-3, conflict:-5, lob:2 }, ignored:{ chaos:2, conflict:4, entity:1 }, failed:{ chaos:5, conflict:7, entity:3, lob:-2 } };
+}
+function generateOneMission({ level, campaign, forcedType, forcedEntity }){
+  const c = campaign || DEFAULT_CAMPAIGN();
+  const type = forcedType || weightedMissionType(c);
   const loc = pick(MISSION_LOC);
-  const entity = pick(MISSION_ENTITIES);
-  const chaos = Math.max(0, Math.min(100, Number(city&&city.chaos)||0));
+  const entity = forcedEntity || weightedEntity(c);
   const code = 'K-'+String(100+Math.floor(Math.random()*900));
   const title = pick(MISSION_WORD1)+' '+pick(MISSION_WORD2);
-  const summaryAgent = `Um caso de ${type.toLowerCase()} é reportado em ${loc}. A L.O.B. recebeu autorização para investigar.`;
+  const relevant = CRIME_TYPES.includes(type) ? c.crime : ANOMALY_TYPES.includes(type) ? c.anomalies : c.conflict;
+  const flavor = relevant>=60 ? 'A região já vive um clima de violência e instabilidade; qualquer erro pode piorar tudo.'
+    : relevant>=30 ? 'Há indícios de que existe organização por trás do caso.'
+    : 'À primeira vista parece um caso isolado.';
+  const summaryAgent = `Um caso de ${type.toLowerCase()} é reportado em ${loc}. ${flavor} A L.O.B. recebeu autorização para investigar.`;
   const hook = `A L.O.B. recebe um chamado sobre ${type.toLowerCase()} em ${loc}. `+pick([
     'Um funcionário local aciona a linha de emergência.', 'Uma denúncia anônima chega ao escritório.',
     'Um agente de campo relata algo fora do padrão.', 'Um relatório policial é encaminhado à L.O.B. por engano.'
@@ -453,19 +519,195 @@ function generateOneMission({ level, city }){
     { label:'Final B', text:'O caso é contido, mas com um custo ou consequência lateral.' },
     { label:'Final C', text:'A equipe falha e o caso se transforma em algo maior.' }
   ];
-  const consequences = {
-    completed: { chaos:-4, crime:-3, entity:0, lob:2 },
-    ignored: { chaos:2, crime:3, entity:2, lob:0 },
-    failed: { chaos:6, crime:6, entity:5, lob:-2 }
-  };
   const clueCount = 3 + Math.floor(Math.random()*4);
-  const clueTexts = pickN(MISSION_CLUE_TEMPLATES, clueCount);
-  const clues = clueTexts.map((text, i) => ({
-    text, category: pick(MISSION_CLUE_CATEGORIES),
+  const clues = pickN(MISSION_CLUE_TEMPLATES, clueCount).map((text, i) => ({
+    text, category: pick(MISSION_CLUE_CATEGORIES.filter(k=>k!=='conexao')),
     reveals: i===clueCount-1 ? `Conexão com outro caso ligado a ${entity}.` : null,
     visibility: i>=clueCount-2 ? 'secreto' : 'publico'
   }));
-  return { code, title, type, loc, priority: chaos>=60?'alta':'normal', kind:'normal', entity, summaryAgent, summaryGm, hook, development, climax, outcomes, consequences, clues };
+  return { code, title, type, loc, priority: relevant>=60?'alta':'normal', kind:'normal', entity, summaryAgent, summaryGm, hook, development, climax, outcomes,
+    consequences: consequencesForType(type), clues };
+}
+
+async function insertGeneratedMission(draft, { level, status, createdBy, triggeredBy }){
+  const now = new Date().toISOString();
+  const id = 'mis-'+crypto.randomBytes(8).toString('hex');
+  const row = {
+    id, code: draft.code, level, title: draft.title, type: draft.type, loc: draft.loc,
+    priority: draft.priority, status, kind: draft.kind,
+    summary_agent: draft.summaryAgent, summary_gm: draft.summaryGm, hook: draft.hook, development: draft.development, climax: draft.climax,
+    outcomes_json: JSON.stringify(draft.outcomes), consequences_json: JSON.stringify(draft.consequences), triggers_json: JSON.stringify(draft.triggers||[]),
+    entity: draft.entity, region_id: null, triggered_by: triggeredBy||null,
+    created_by: createdBy, created_at: now, updated_at: now
+  };
+  await run('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(row));
+  for (let ci=0; ci<draft.clues.length; ci++){
+    const c = draft.clues[ci];
+    await run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+      'clue-'+crypto.randomBytes(6).toString('hex'), id, c.text, c.category, c.reveals||null, c.revealsMissionId||null, c.visibility, null, 0, ci
+    ]);
+  }
+  return id;
+}
+async function addConnectionClue(missionId, targetId, targetTitle){
+  const countRow = await get('SELECT COUNT(*) as n FROM mission_clues WHERE mission_id=?', [missionId]);
+  await run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+    'clue-'+crypto.randomBytes(6).toString('hex'), missionId,
+    `Um detalhe deste caso aponta para o caso "${targetTitle}".`, 'conexao', `Conexão com ${targetTitle}`, targetId, 'secreto', null, 0, countRow ? countRow.n : 0
+  ]);
+}
+
+/* ---- Emergências: regras automáticas + alertas pro admin ---- */
+const EMERGENCY_RULES = [
+  { id:'chaos70', test:c=>c.chaos>=70, reset:c=>c.chaos<60, type:'Anomalia', reason:'Caos em nível crítico',
+    titles:['COLAPSO DO METRÔ','ENTIDADE MANIFESTADA NA CIDADE NOVA','DESAPARECIMENTO DE CENTENAS DE PESSOAS'] },
+  { id:'crime80', test:c=>c.crime>=80, reset:c=>c.crime<70, type:'Assassinato', reason:'Criminalidade em nível crítico',
+    titles:['GUERRA ENTRE FACÇÕES','ATAQUE EM MASSA NO PORTO'] },
+  { id:'anomalies75', test:c=>c.anomalies>=75, reset:c=>c.anomalies<65, type:'Lugar impossível', reason:'Anomalias fora de controle',
+    titles:['LUGAR IMPOSSÍVEL ABERTO NO CENTRO','SINAL AMPLIFICADO SOBRE KARSK'] }
+];
+async function createEmergencyMission(c, { type, title, triggeredBy, reasonText }){
+  const draft = generateOneMission({ level:c.level, campaign:c, forcedType:type });
+  draft.title = title; draft.kind = 'emergencial'; draft.priority = 'critica';
+  draft.summaryAgent = `EMERGÊNCIA: ${title}. A L.O.B. foi acionada com prioridade máxima. ${reasonText||''}`.trim();
+  draft.consequences = {
+    completed:{ chaos:-8, crime:-6, anomalies:-6, lob:4 },
+    ignored:{ chaos:6, crime:6, anomalies:4, entity:4 },
+    failed:{ chaos:12, crime:10, anomalies:8, entity:8, lob:-4 }
+  };
+  const id = await insertGeneratedMission(draft, { level:c.level, status:'locked', createdBy:'sistema', triggeredBy });
+  return await get('SELECT * FROM missions WHERE id=?', [id]);
+}
+async function createEmergencyAlert(mission, reason, level){
+  const existing = await get("SELECT id FROM emergency_alerts WHERE mission_id=? AND status='pending'", [mission.id]);
+  if (existing) return;
+  await run('INSERT INTO emergency_alerts VALUES (?, ?, ?, ?, ?, ?)', ['alert-'+crypto.randomBytes(6).toString('hex'), mission.id, reason, 'pending', new Date().toISOString(), null]);
+  broadcastLive('emergency_alert', { missionId: mission.id });
+}
+async function checkEmergencyRules(c, notes){
+  for (const rule of EMERGENCY_RULES){
+    if (rule.reset(c)) c.emergencyFlags[rule.id] = false;
+    if (rule.test(c) && !c.emergencyFlags[rule.id]){
+      c.emergencyFlags[rule.id] = true;
+      const alreadyPending = await get("SELECT id FROM emergency_alerts WHERE status='pending' AND reason=?", [rule.reason]);
+      if (alreadyPending) continue;
+      const mission = await createEmergencyMission(c, { type:rule.type, title:pick(rule.titles), reasonText:rule.reason+'.' });
+      await createEmergencyAlert(mission, rule.reason, c.level);
+      notes.push(`⚠ CONDIÇÃO CRÍTICA DETECTADA: ${rule.reason}. Emergência pronta para ativação: ${mission.title}.`);
+    }
+  }
+}
+
+/* ---- Gatilhos ----
+   trigger = { id, when, value, entity, action, targetMissionId, clueId, delta, fired }
+   when:   completed | failed | ignored   (eventos da missão)
+           chaos_gte | crime_gte | anomalies_gte | conflict_gte | entity_gte   (limiares)
+   action: unlock_mission | stat_delta | reveal_clue                                     */
+async function runTrigger(trig, mission, c, notes){
+  if (trig.action==='stat_delta'){
+    applyDelta(c, trig.delta||{}, mission.entity);
+    notes.push(`Gatilho de "${mission.title}": o estado de Karsk foi alterado.`);
+  } else if (trig.action==='unlock_mission' && trig.targetMissionId){
+    const target = await get('SELECT * FROM missions WHERE id=?', [trig.targetMissionId]);
+    if (target && target.status==='locked'){
+      if (target.kind==='emergencial'){
+        await createEmergencyAlert(target, `Gatilho de "${mission.title}"`, c.level);
+        notes.push(`⚠ CONDIÇÃO CRÍTICA DETECTADA: "${mission.title}" liberou a emergência "${target.title}".`);
+      } else {
+        await run("UPDATE missions SET status='draft', triggered_by=?, updated_at=? WHERE id=?", [mission.id, new Date().toISOString(), target.id]);
+        notes.push(`🔓 "${mission.title}" desbloqueou a missão "${target.title}" (pronta para votação).`);
+      }
+    }
+  } else if (trig.action==='reveal_clue' && trig.clueId){
+    await run("UPDATE mission_clues SET visibility='publico', found=1 WHERE id=?", [trig.clueId]);
+    notes.push(`🔎 Uma nova pista foi liberada em "${mission.title}".`);
+  }
+}
+async function evaluateEventTriggers(mission, outcome, c){
+  const triggers = JSON.parse(mission.triggers_json||'[]'); const notes = []; let changed = false;
+  for (const t of triggers){
+    if (t.when===outcome && !t.fired){ await runTrigger(t, mission, c, notes); t.fired = true; changed = true; }
+  }
+  if (changed) await run('UPDATE missions SET triggers_json=? WHERE id=?', [JSON.stringify(triggers), mission.id]);
+  return notes;
+}
+async function evaluateThresholdTriggers(c){
+  const rows = await all("SELECT * FROM missions WHERE status NOT IN ('locked','archived')");
+  const notes = [];
+  for (const m of rows){
+    const triggers = JSON.parse(m.triggers_json||'[]'); let changed = false;
+    for (const t of triggers){
+      if (t.fired) continue;
+      const v = Number(t.value)||0; let hit = false;
+      if (t.when==='chaos_gte') hit = c.chaos>=v;
+      else if (t.when==='crime_gte') hit = c.crime>=v;
+      else if (t.when==='anomalies_gte') hit = c.anomalies>=v;
+      else if (t.when==='conflict_gte') hit = c.conflict>=v;
+      else if (t.when==='entity_gte') hit = ((c.entities||{})[t.entity]||0)>=v;
+      if (hit){ await runTrigger(t, m, c, notes); t.fired = true; changed = true; }
+    }
+    if (changed) await run('UPDATE missions SET triggers_json=? WHERE id=?', [JSON.stringify(triggers), m.id]);
+  }
+  return notes;
+}
+
+/* ---- Missões ignoradas continuam acontecendo ---- */
+const EVOLUTION_CLUES = [
+  'Moradores relatam que a situação no local piorou desde a última visita da L.O.B.',
+  'Surgem novos registros do incidente em locais próximos.',
+  'Alguém começou a vender informações sobre o caso.',
+  'Uma testemunha que antes se recusava a falar agora quer conversar.',
+  'O mesmo padrão do caso aparece em outra parte da cidade.'
+];
+async function evolveIgnoredMission(m, stage, c, notes){
+  const clueCount = (await get('SELECT COUNT(*) as n FROM mission_clues WHERE mission_id=?', [m.id])).n;
+  const addClue = async (visibility) => run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+    'clue-'+crypto.randomBytes(6).toString('hex'), m.id, pick(EVOLUTION_CLUES), 'ambiental', null, null, visibility, null, 0, clueCount + (visibility==='publico'?0:1)
+  ]);
+  const now = new Date().toISOString();
+  if (stage===1){
+    await addClue('publico');
+    notes.push(`🔎 Novos indícios surgiram em "${m.title}" enquanto ela era ignorada.`);
+  } else if (stage===2){
+    await addClue('secreto');
+    if (m.priority==='baixa'||m.priority==='normal') await run("UPDATE missions SET priority='alta', updated_at=? WHERE id=?", [now, m.id]);
+    const draft = generateOneMission({ level:c.level+1, campaign:c, forcedType:m.type, forcedEntity:m.entity });
+    draft.title = `Desdobramento: ${m.title}`; draft.loc = m.loc;
+    const newId = await insertGeneratedMission(draft, { level:c.level+1, status:'draft', createdBy:'sistema', triggeredBy:m.id });
+    await addConnectionClue(newId, m.id, m.title);
+    notes.push(`🕸️ O caso ignorado "${m.title}" gerou um novo caso: "${draft.title}" (rascunho no próximo nível).`);
+  } else if (stage>=3){
+    await run("UPDATE missions SET priority='critica', updated_at=? WHERE id=?", [now, m.id]);
+    const exists = await get("SELECT id FROM missions WHERE kind='emergencial' AND triggered_by=?", [m.id]);
+    if (!exists){
+      const emergency = await createEmergencyMission(c, { type:m.type, title:`EMERGÊNCIA: ${m.title}`, triggeredBy:m.id, reasonText:'Um caso ignorado por tempo demais saiu de controle.' });
+      await createEmergencyAlert(emergency, `O caso ignorado "${m.title}" escalou`, c.level);
+      notes.push(`⚠ CONDIÇÃO CRÍTICA DETECTADA: "${m.title}" escalou para uma emergência.`);
+    }
+  }
+}
+
+async function applyVoteCloseEffects(round, missionIds, winnerMissionId, tallyRows){
+  const c = await getCampaign(); const notes = [];
+  const parts = [];
+  for (const mid of missionIds){
+    const m = await get('SELECT title FROM missions WHERE id=?', [mid]);
+    const n = (tallyRows.find(r=>r.mission_id===mid)||{n:0}).n;
+    parts.push(`${m?m.title:mid}: ${n} voto(s)`);
+  }
+  const winner = await get('SELECT title FROM missions WHERE id=?', [winnerMissionId]);
+  await logCampaign(c.level, 'vote', `Votação #${round.round} — ${parts.join(' · ')}. Escolhida: ${winner?winner.title:'—'}.`);
+  for (const mid of missionIds){
+    if (mid===winnerMissionId) continue;
+    const m = await get('SELECT * FROM missions WHERE id=?', [mid]);
+    if (!m) continue;
+    notes.push(`"${m.title}" foi ignorada e continua acontecendo.`);
+    notes.push(...await evaluateEventTriggers(m, 'ignored', c));
+  }
+  notes.push(...await evaluateThresholdTriggers(c));
+  await checkEmergencyRules(c, notes);
+  await saveCampaign(c);
+  for (const n of notes) await logCampaign(c.level, 'ignored', n);
 }
 
 app.get('/api/missions', auth, ah(async (req, res) => {
@@ -473,7 +715,7 @@ app.get('/api/missions', auth, ah(async (req, res) => {
   let sql = 'SELECT * FROM missions WHERE 1=1'; const args = [];
   if (req.query.level){ sql += ' AND level=?'; args.push(Number(req.query.level)); }
   if (req.query.status){ sql += ' AND status=?'; args.push(req.query.status); }
-  if (!isAdmin) sql += " AND status!='draft'";
+  if (!isAdmin) sql += " AND status NOT IN ('draft','locked')";
   sql += ' ORDER BY created_at DESC';
   const rows = await all(sql, args);
   const missions = [];
@@ -510,28 +752,17 @@ app.post('/api/missions', auth, admin, ah(async (req, res) => {
 
 app.post('/api/missions/generate', auth, admin, ah(async (req, res) => {
   const count = Math.max(1, Math.min(5, Number(req.body.count)||1));
-  const level = Number(req.body.level)||1;
-  const city = req.body.city || {};
-  const now = new Date().toISOString();
-  const created = [];
+  const c = await getCampaign();
+  const level = Number(req.body.level) || c.level;
+  const themeEntity = count>1 ? weightedEntity(c) : null;
+  const created = []; const batch = [];
   for (let i=0;i<count;i++){
-    const draft = generateOneMission({ level, city });
-    const id = 'mis-'+crypto.randomBytes(8).toString('hex');
-    const row = {
-      id, code: draft.code, level, title: draft.title, type: draft.type, loc: draft.loc,
-      priority: draft.priority, status: 'draft', kind: draft.kind,
-      summary_agent: draft.summaryAgent, summary_gm: draft.summaryGm, hook: draft.hook, development: draft.development, climax: draft.climax,
-      outcomes_json: JSON.stringify(draft.outcomes), consequences_json: JSON.stringify(draft.consequences), triggers_json: '[]',
-      entity: draft.entity, region_id: null, triggered_by: null,
-      created_by: req.user.username, created_at: now, updated_at: now
-    };
-    await run('INSERT INTO missions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', Object.values(row));
-    for (let ci=0; ci<draft.clues.length; ci++){
-      const c = draft.clues[ci];
-      await run('INSERT INTO mission_clues VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
-        'clue-'+crypto.randomBytes(6).toString('hex'), id, c.text, c.category, c.reveals||null, null, c.visibility, null, 0, ci
-      ]);
-    }
+    const draft = generateOneMission({ level, campaign:c, forcedEntity:themeEntity });
+    const id = await insertGeneratedMission(draft, { level, status:'draft', createdBy:req.user.username });
+    // Casos do mesmo lote não são independentes: cada um aponta (por uma pista secreta) pro anterior, e o terceiro em diante também pro primeiro.
+    if (batch.length) await addConnectionClue(id, batch[batch.length-1].id, batch[batch.length-1].title);
+    if (batch.length>=2) await addConnectionClue(id, batch[0].id, batch[0].title);
+    batch.push({ id, title: draft.title });
     created.push(await missionWithClues(id, true));
   }
   await logAudit(req.user.username, 'gerar_missoes', count+' missão(ões), nível '+level);
@@ -593,6 +824,109 @@ app.delete('/api/missions/clues/:id', auth, admin, ah(async (req, res) => {
   res.json({ ok: true });
 }));
 
+/* ---- Estado da campanha ---- */
+app.get('/api/campaign', auth, ah(async (req, res) => {
+  const isAdmin = req.user.role==='admin';
+  const c = await getCampaign();
+  const out = { campaign: publicCampaign(c, isAdmin) };
+  if (isAdmin){
+    const rows = await all("SELECT a.id, a.mission_id, a.reason, a.created_at, m.title FROM emergency_alerts a LEFT JOIN missions m ON m.id=a.mission_id WHERE a.status='pending' ORDER BY a.created_at");
+    out.alerts = rows.map(a => ({ id:a.id, missionId:a.mission_id, missionTitle:a.title, reason:a.reason, createdAt:a.created_at }));
+  }
+  res.json(out);
+}));
+
+app.put('/api/campaign', auth, admin, ah(async (req, res) => {
+  const c = await getCampaign(); const b = req.body || {}; const notes = [];
+  CITY_STATS.forEach(k => { if (b[k]!==undefined) c[k] = clamp100(b[k]); });
+  if (b.level!==undefined) c.level = Math.max(1, Math.min(10, Number(b.level)||1));
+  if (b.entities && typeof b.entities==='object') Object.keys(b.entities).forEach(n => { if (c.entities[n]!==undefined) c.entities[n] = clamp100(b.entities[n]); });
+  notes.push(...await evaluateThresholdTriggers(c));
+  await checkEmergencyRules(c, notes);
+  await saveCampaign(c);
+  await logCampaign(c.level, 'manual', 'Estado de Karsk ajustado manualmente pelo admin.');
+  for (const n of notes) await logCampaign(c.level, 'trigger', n);
+  await logAudit(req.user.username, 'ajustar_campanha', null);
+  broadcastLive('campaign_updated', {});
+  res.json({ campaign: publicCampaign(c, true), notes });
+}));
+
+app.get('/api/campaign/log', auth, admin, ah(async (req, res) => {
+  const limit = Math.min(300, Math.max(1, Number(req.query.limit)||100));
+  res.json({ entries: await all('SELECT * FROM campaign_log ORDER BY created_at DESC LIMIT ?', [limit]) });
+}));
+
+app.post('/api/campaign/advance', auth, admin, ah(async (req, res) => {
+  const c = await getCampaign();
+  if (c.level>=10) return res.status(400).json({ error: 'MAX_LEVEL' });
+  const notes = [];
+  const ignored = await all("SELECT * FROM missions WHERE status='ignored'");
+  for (const m of ignored){
+    const evo = await get('SELECT stage FROM mission_evolution WHERE mission_id=?', [m.id]);
+    const stage = (evo ? evo.stage : 0) + 1;
+    const cons = JSON.parse(m.consequences_json||'{}').ignored;
+    applyDelta(c, cons, m.entity);
+    notes.push(`⚠ "${m.title}" continuou acontecendo enquanto era ignorada (estágio ${stage}).`);
+    await evolveIgnoredMission(m, stage, c, notes);
+    await run('INSERT INTO mission_evolution VALUES (?, ?, ?) ON CONFLICT(mission_id) DO UPDATE SET stage=excluded.stage, last_level=excluded.last_level', [m.id, stage, c.level]);
+  }
+  c.level += 1;
+  notes.push(`▶ Nível ${c.level} iniciado.`);
+  notes.push(...await evaluateThresholdTriggers(c));
+  await checkEmergencyRules(c, notes);
+  await saveCampaign(c);
+  for (const n of notes) await logCampaign(c.level, 'advance', n);
+  await logAudit(req.user.username, 'avancar_nivel', 'nível '+c.level);
+  broadcastLive('campaign_updated', {});
+  res.json({ campaign: publicCampaign(c, true), notes });
+}));
+
+/* ---- Concluir / fracassar uma missão: aplica as consequências e dispara gatilhos ---- */
+app.post('/api/missions/:id/resolve', auth, admin, ah(async (req, res) => {
+  const outcome = req.body.outcome;
+  if (!['completed','failed'].includes(outcome)) return res.status(400).json({ error: 'INVALID_OUTCOME' });
+  const m = await get('SELECT * FROM missions WHERE id=?', [req.params.id]);
+  if (!m) return res.status(404).json({ error: 'NOT_FOUND' });
+  const c = await getCampaign();
+  const cons = JSON.parse(m.consequences_json||'{}')[outcome];
+  applyDelta(c, cons, m.entity);
+  await run('UPDATE missions SET status=?, updated_at=? WHERE id=?', [outcome, new Date().toISOString(), m.id]);
+  const notes = [`${outcome==='completed'?'✅ Missão concluída':'❌ Missão fracassada'}: "${m.title}".`];
+  notes.push(...await evaluateEventTriggers(m, outcome, c));
+  notes.push(...await evaluateThresholdTriggers(c));
+  await checkEmergencyRules(c, notes);
+  await saveCampaign(c);
+  for (const n of notes) await logCampaign(c.level, 'resolve', n);
+  await logAudit(req.user.username, outcome==='completed'?'concluir_missao':'fracassar_missao', m.title);
+  broadcastLive('campaign_updated', {});
+  res.json({ campaign: publicCampaign(c, true), notes, mission: await missionWithClues(m.id, true) });
+}));
+
+/* ---- Alertas de emergência: o admin decide se ativa ou adia ---- */
+app.post('/api/campaign/alerts/:id/activate', auth, admin, ah(async (req, res) => {
+  const a = await get('SELECT * FROM emergency_alerts WHERE id=?', [req.params.id]);
+  if (!a || a.status!=='pending') return res.status(400).json({ error: 'ALERT_NOT_PENDING' });
+  const m = await get('SELECT * FROM missions WHERE id=?', [a.mission_id]);
+  if (!m) return res.status(404).json({ error: 'MISSION_NOT_FOUND' });
+  const withVote = !!req.body.withVote; const now = new Date().toISOString();
+  await run('UPDATE missions SET status=?, updated_at=? WHERE id=?', [withVote ? 'draft' : 'active', now, m.id]);
+  await run("UPDATE emergency_alerts SET status='activated', resolved_at=? WHERE id=?", [now, a.id]);
+  const c = await getCampaign();
+  await logCampaign(c.level, 'emergency', `Emergência ativada: "${m.title}"${withVote ? ' (vai para votação)' : ' (sem votação)'}.`);
+  await logAudit(req.user.username, 'ativar_emergencia', m.title);
+  broadcastLive('emergency_activated', { missionId: m.id });
+  res.json({ ok: true });
+}));
+app.post('/api/campaign/alerts/:id/dismiss', auth, admin, ah(async (req, res) => {
+  const a = await get('SELECT * FROM emergency_alerts WHERE id=?', [req.params.id]);
+  if (!a || a.status!=='pending') return res.status(400).json({ error: 'ALERT_NOT_PENDING' });
+  const m = await get('SELECT title FROM missions WHERE id=?', [a.mission_id]);
+  await run("UPDATE emergency_alerts SET status='dismissed', resolved_at=? WHERE id=?", [new Date().toISOString(), a.id]);
+  const c = await getCampaign();
+  await logCampaign(c.level, 'emergency', `Emergência adiada: "${m ? m.title : a.mission_id}".`);
+  res.json({ ok: true });
+}));
+
 app.get('/api/missions/rounds/current', auth, ah(async (req, res) => {
   const round = await get('SELECT * FROM vote_rounds ORDER BY round DESC LIMIT 1');
   if (!round) return res.json({ round: null, missions: [], tally: {}, myVote: null, voters: null });
@@ -641,6 +975,7 @@ app.post('/api/missions/rounds/:round/close', auth, admin, ah(async (req, res) =
   const now = new Date().toISOString();
   await run('UPDATE vote_rounds SET status=?, closed_at=?, winner_mission_id=? WHERE round=?', ['closed', now, winnerMissionId, round.round]);
   for (const mid of missionIds) await run('UPDATE missions SET status=?, updated_at=? WHERE id=?', [mid===winnerMissionId ? 'active' : 'ignored', now, mid]);
+  await applyVoteCloseEffects(round, missionIds, winnerMissionId, tallyRows);
   await logAudit(req.user.username, 'fechar_votacao_missao', 'rodada '+round.round);
   broadcastLive('mission_round_closed', { round: round.round, winnerMissionId });
   res.json({ ok: true, winnerMissionId });
@@ -755,10 +1090,18 @@ app.get('/api/admin/backup', auth, admin, ah(async (req, res) => {
   const missionRounds = await all('SELECT * FROM mission_rounds ORDER BY round');
   const missionOptions = (await all('SELECT * FROM mission_options')).map(publicMissionOption);
   const missionVotes = await all('SELECT * FROM mission_votes');
+  const missions = await all('SELECT * FROM missions');
+  const missionClues = await all('SELECT * FROM mission_clues');
+  const voteRounds = await all('SELECT * FROM vote_rounds');
+  const missionBallots = await all('SELECT * FROM mission_ballots');
+  const campaign = await getCampaign();
+  const campaignLog = await all('SELECT * FROM campaign_log ORDER BY created_at');
+  const emergencyAlerts = await all('SELECT * FROM emergency_alerts');
+  const missionEvolution = await all('SELECT * FROM mission_evolution');
   res.json({
-    exportedAt: new Date().toISOString(), version: 3, service: 'karsk-backend',
+    exportedAt: new Date().toISOString(), version: 4, service: 'karsk-backend',
     shared: records.map(r => ({ key: r.record_key, value: JSON.parse(r.value_json), updatedAt: r.updated_at })),
-    users, agentFiles, auditLog, events, transmissions, states, missionRounds, missionOptions, missionVotes
+    users, agentFiles, auditLog, events, transmissions, states, missionRounds, missionOptions, missionVotes, missions, missionClues, voteRounds, missionBallots, campaign, campaignLog, emergencyAlerts, missionEvolution
   });
 }));
 

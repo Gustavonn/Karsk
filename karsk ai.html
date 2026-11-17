@@ -1756,7 +1756,7 @@ const ARCHIVE_STORE_KEY = 'karsk:mission-archive';
 let NEWS_ITEMS = [];
 let MISSION_ARCHIVE = [];
 const LIVE_KEYS = {presence:'karsk:live:presence',events:'karsk:live:events',transmissions:'karsk:live:transmissions',states:'karsk:live:states'};
-const LIVE_STATE = {presence:[],events:[],transmissions:[],states:[],activeState:null,activeTab:'agents',pollHandle:null,presenceHandle:null,eventSource:null,missionRound:null,roundMissions:[],missionTally:{},myMissionVote:null,missionVoters:null,missions:[],missionLevel:1,missionSelection:new Set(),activeMission:null};
+const LIVE_STATE = {presence:[],events:[],transmissions:[],states:[],activeState:null,activeTab:'agents',pollHandle:null,presenceHandle:null,eventSource:null,missionRound:null,roundMissions:[],missionTally:{},myMissionVote:null,missionVoters:null,missions:[],missionLevel:1,missionSelection:new Set(),activeMissions:[],allMissions:[],campaign:null,alerts:[],levelInitialized:false};
 function liveText(value){ return escapeHTML(value == null ? '' : value); }
 function liveNow(){ return new Date().toISOString(); }
 async function loadLiveLocal(){
@@ -1820,18 +1820,31 @@ async function pollNewsUpdates(){
 }
 async function pollMissionUpdates(){
   if (!ONLINE_API_BASE) return [];
+  await refreshCampaign();
   await refreshMissionRound();
   await refreshMissionList();
   const round = LIVE_STATE.missionRound;
-  if (!round) return [];
   const fresh = [];
-  const openKey = 'missionround-open:'+round.number;
-  const closeKey = 'missionround-close:'+round.number;
-  if (round.status==='voting' && !SEEN_LIVE_IDS.has(openKey)){ SEEN_LIVE_IDS.add(openKey); fresh.push({kind:'mission_round', item:{title:'Votação de missão #'+round.number+' está aberta.'}}); }
-  if (round.status==='closed' && !SEEN_LIVE_IDS.has(closeKey)){
-    SEEN_LIVE_IDS.add(closeKey);
-    const winner = LIVE_STATE.roundMissions.find(m=>m.id===round.winnerMissionId);
-    fresh.push({kind:'mission_result', item:{title: winner ? winner.title : 'Votação encerrada sem votos.'}});
+  if (round){
+    const openKey = 'missionround-open:'+round.number;
+    const closeKey = 'missionround-close:'+round.number;
+    if (round.status==='voting' && !SEEN_LIVE_IDS.has(openKey)){ SEEN_LIVE_IDS.add(openKey); fresh.push({kind:'mission_round', item:{title:'Votação de missão #'+round.number+' está aberta.'}}); }
+    if (round.status==='closed' && !SEEN_LIVE_IDS.has(closeKey)){
+      SEEN_LIVE_IDS.add(closeKey);
+      const winner = LIVE_STATE.roundMissions.find(m=>m.id===round.winnerMissionId);
+      fresh.push({kind:'mission_result', item:{title: winner ? winner.title : 'Votação encerrada sem votos.'}});
+    }
+  }
+  if (STATE.role!=='admin'){
+    (LIVE_STATE.activeMissions||[]).forEach(m=>{
+      const key = 'missionactive:'+m.id;
+      if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); fresh.push({kind: m.kind==='emergencial' ? 'mission_emergency' : 'mission_active', item:{id:m.id, title:m.title}}); }
+    });
+  } else {
+    (LIVE_STATE.alerts||[]).forEach(a=>{
+      const key = 'critalert:'+a.id;
+      if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); fresh.push({kind:'crit_alert', item:{id:a.id, title:a.reason+': '+(a.missionTitle||'')}}); }
+    });
   }
   return fresh;
 }
@@ -1854,8 +1867,8 @@ async function refreshLive(){
     if (!seenLiveIsFreshBootstrap){
       playAudio('live_alert');
       const first = freshlyNew[0];
-      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]', news:'[ NOVA NOTÍCIA ]', mission_round:'[ VOTAÇÃO ABERTA ]', mission_result:'[ MISSÃO ESCOLHIDA ]'};
-      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"', news: first.item.title||'Nova notícia publicada.', mission_round: first.item.title, mission_result: first.item.title};
+      const headingFor = {event:(['HIGH','CRITICAL'].includes(first.item.severity)?'[ AVISO IMPORTANTE ]':'[ NOVO EVENTO ]'), transmission:'[ RÁDIO L.O.B. ]', file:'[ ARQUIVO COMPARTILHADO ]', news:'[ NOVA NOTÍCIA ]', mission_round:'[ VOTAÇÃO ABERTA ]', mission_result:'[ MISSÃO ESCOLHIDA ]', mission_active:'[ NOVO CASO ATIVO ]', mission_emergency:'[ 🚨 EMERGÊNCIA ATIVADA ]', crit_alert:'[ ⚠ CONDIÇÃO CRÍTICA ]'};
+      const labelFor = {event: first.item.title||'Novo evento disponível.', transmission: first.item.body||first.item.sender||'Nova transmissão disponível.', file: (first.item.owner||'Um agente')+' compartilhou "'+(first.item.title||'um arquivo')+'"', news: first.item.title||'Nova notícia publicada.', mission_round: first.item.title, mission_result: first.item.title, mission_active: first.item.title, mission_emergency: first.item.title, crit_alert: first.item.title};
       const heading = headingFor[first.kind];
       const label = freshlyNew.length>1 ? freshlyNew.length+' novos registros disponíveis' : labelFor[first.kind];
       showDiscoveryToast(heading, label);
@@ -1915,14 +1928,41 @@ function renderLivePanel(){
    (podendo trocar o voto), admin fecha quando quiser. Tudo pelo mesmo backend
    e pelo mesmo ciclo de refreshLive() — sem lista paralela.
    ============================================================================ */
-const MISSION_STATUS_LABEL={draft:'RASCUNHO',voting:'EM VOTAÇÃO',active:'ATIVA',ignored:'IGNORADA',completed:'CONCLUÍDA',failed:'FRACASSADA',archived:'ARQUIVADA'};
+const MISSION_STATUS_LABEL={locked:'BLOQUEADA',draft:'RASCUNHO',voting:'EM VOTAÇÃO',active:'ATIVA',ignored:'IGNORADA',completed:'CONCLUÍDA',failed:'FRACASSADA',archived:'ARQUIVADA'};
 const MISSION_PRIORITY_LABEL={baixa:'BAIXA',normal:'NORMAL',alta:'ALTA',critica:'CRÍTICA'};
 const MISSION_CLUE_CATEGORY_LABEL={evidencia_fisica:'EVIDÊNCIA FÍSICA',testemunho:'TESTEMUNHO',documento:'DOCUMENTO',gravacao:'GRAVAÇÃO',comportamento:'COMPORTAMENTO',ambiental:'PISTA AMBIENTAL',conexao:'CONEXÃO COM OUTRO CASO',falsa:'PISTA FALSA'};
+const CITY_STAT_LABEL={chaos:'☠ Caos',crime:'💀 Criminalidade',anomalies:'🌀 Anomalias',conflict:'⚔ Conflito',corporate:'🏢 Controle corporativo',lob:'🔎 Influência L.O.B.'};
+const MISSION_ENTITY_NAMES=['O Vazio','A Carne','O Sinal','A Máscara','O Abismo'];
+const TRIGGER_WHEN_LABEL={completed:'Se for concluída',failed:'Se fracassar',ignored:'Se for ignorada',chaos_gte:'Se Caos ≥',crime_gte:'Se Criminalidade ≥',anomalies_gte:'Se Anomalias ≥',conflict_gte:'Se Conflito ≥',entity_gte:'Se influência da entidade ≥'};
+const TRIGGER_ACTION_LABEL={unlock_mission:'desbloqueia a missão',stat_delta:'altera o estado de Karsk',reveal_clue:'libera uma pista secreta'};
+const CONS_FIELDS=[['chaos','Caos'],['crime','Crim.'],['anomalies','Anom.'],['conflict','Confl.'],['corporate','Corp.'],['entity','Entid.'],['lob','L.O.B.']];
+const CAMPAIGN_LOG_ICON={vote:'🗳',ignored:'⚠',resolve:'✅',advance:'▶',emergency:'🚨',trigger:'🔔',manual:'✏'};
 
+/* ---------- carregamento de dados ---------- */
 async function refreshMissionList(){
   if (!ONLINE_API_BASE || STATE.role!=='admin') return;
   try{ const data = await onlineRequest('/missions?level='+LIVE_STATE.missionLevel); LIVE_STATE.missions = data.missions||[]; }
   catch(e){ LIVE_STATE.missions = []; }
+}
+async function refreshAllMissions(){
+  if (!ONLINE_API_BASE || STATE.role!=='admin') return;
+  try{ LIVE_STATE.allMissions = (await onlineRequest('/missions')).missions||[]; }catch(e){ LIVE_STATE.allMissions = []; }
+}
+function applyCampaignChaosToHud(){
+  if (!LIVE_STATE.campaign) return;
+  STATE.chaos = LIVE_STATE.campaign.chaos;
+  if (chaosValueEl) chaosValueEl.textContent = Math.round(STATE.chaos)+'%';
+  if (chaosFillEl){ chaosFillEl.style.width = STATE.chaos+'%'; chaosFillEl.style.background = STATE.chaos>65 ? 'var(--danger)' : (STATE.chaos>38 ? 'var(--phosphor)' : 'var(--brass-bright)'); }
+}
+async function refreshCampaign(){
+  if (!ONLINE_API_BASE) return;
+  try{
+    const data = await onlineRequest('/campaign');
+    LIVE_STATE.campaign = data.campaign;
+    LIVE_STATE.alerts = data.alerts || [];
+    if (!LIVE_STATE.levelInitialized){ LIVE_STATE.missionLevel = data.campaign.level; LIVE_STATE.levelInitialized = true; }
+    applyCampaignChaosToHud();
+  }catch(e){}
 }
 async function refreshMissionRound(){
   if (!ONLINE_API_BASE) return;
@@ -1934,17 +1974,17 @@ async function refreshMissionRound(){
     LIVE_STATE.myMissionVote = data.myVote || null;
     LIVE_STATE.missionVoters = data.voters || null;
   }catch(e){}
-  if (STATE.role!=='admin' && (!LIVE_STATE.missionRound || LIVE_STATE.missionRound.status!=='voting')){
-    try{ const activeData = await onlineRequest('/missions?status=active'); LIVE_STATE.activeMission = (activeData.missions||[])[0]||null; }
-    catch(e){ LIVE_STATE.activeMission = null; }
-  }
+  try{ LIVE_STATE.activeMissions = (await onlineRequest('/missions?status=active')).missions || []; }
+  catch(e){ LIVE_STATE.activeMissions = []; }
 }
 
+/* ---------- cartões ---------- */
 function missionAgentCardHTML(m, isWinner){
   const publicClues = (m.clues||[]).filter(c=>c.visibility==='publico');
-  return '<div class="live-row" style="'+(isWinner?'border-color:var(--phosphor)':'')+'"><span><strong>'+(isWinner?'🏆 ':'')+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+
+  const emergency = m.kind==='emergencial';
+  return '<div class="live-row" style="'+(isWinner?'border-color:var(--phosphor)':(emergency?'border-color:var(--danger)':''))+'"><span><strong>'+(isWinner?'🏆 ':(emergency?'🚨 ':''))+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+
     (publicClues.length ? '<br><br><em>Pistas:</em><br>'+publicClues.map(c=>'• '+liveText(c.text)).join('<br>') : '')+
-    '</span><span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+'</span></div>';
+    '</span><span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+(emergency?'<br>EMERGÊNCIA':'')+'</span></div>';
 }
 function missionVoteCardHTML(m, totalVotes){
   const votes = LIVE_STATE.missionTally[m.id]||0;
@@ -1955,24 +1995,52 @@ function missionVoteCardHTML(m, totalVotes){
     const names = LIVE_STATE.missionVoters.filter(v=>v.mission_id===m.id).map(v=>v.username);
     if (names.length) voterNames = '<br><span class="mut" style="font-size:9px">votaram: '+names.join(', ')+'</span>';
   }
-  return '<div class="live-row'+(isMine?' selected':'')+'"><span><strong>'+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+voterNames+'</span>'+
+  return '<div class="live-row'+(isMine?' selected':'')+'"><span><strong>'+(m.kind==='emergencial'?'🚨 ':'')+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+voterNames+'</span>'+
     '<span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+'<br>'+votes+' voto(s) ('+pct+'%)'+
     '<br><button class="live-del-btn" style="background:'+(isMine?'rgba(120,180,120,.25)':'rgba(140,40,30,.25)')+'" data-mission-vote="'+liveText(m.id)+'">'+(isMine?'✓ SEU VOTO':'VOTAR')+'</button>'+
     '</span></div>';
 }
 function missionAdminRowHTML(m){
   const checked = LIVE_STATE.missionSelection.has(m.id);
-  return '<div class="live-row"><span><strong>'+(m.code?'['+liveText(m.code)+'] ':'')+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+'</span>'+
+  const emergency = m.kind==='emergencial';
+  return '<div class="live-row" style="'+(emergency?'border-color:var(--danger)':'')+'"><span><strong>'+(emergency?'🚨 ':'')+(m.code?'['+liveText(m.code)+'] ':'')+liveText(m.title)+'</strong><br>'+liveText(m.summaryAgent)+'</span>'+
     '<span class="live-meta">'+liveText(m.type)+'<br>'+liveText(m.loc)+'<br>'+MISSION_PRIORITY_LABEL[m.priority]+' · '+MISSION_STATUS_LABEL[m.status]+
     (m.status==='draft'?'<br><label style="font-size:9px"><input type="checkbox" data-mission-select="'+liveText(m.id)+'" '+(checked?'checked':'')+'> p/ votação</label>':'')+
+    (m.status==='active'?'<br><button class="live-del-btn" data-mission-resolve="completed:'+liveText(m.id)+'">CONCLUIR</button><button class="live-del-btn" data-mission-resolve="failed:'+liveText(m.id)+'">FRACASSAR</button>':'')+
     '<br><button class="live-del-btn" data-mission-expand="'+liveText(m.id)+'">ABRIR</button>'+
     '<button class="live-del-btn" data-mission-delete="'+liveText(m.id)+'">EXCLUIR</button>'+
     '</span></div>';
 }
+function cityBarHTML(label, value, color){
+  return '<div style="margin:5px 0"><div style="display:flex;justify-content:space-between;font-size:10px"><span>'+label+'</span><b>'+value+'%</b></div>'+
+    '<div style="height:6px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+value+'%;background:'+color+'"></div></div></div>';
+}
+function campaignPanelHTML(){
+  const c = LIVE_STATE.campaign;
+  if (!c) return '';
+  let html = '<div class="live-meta">ESTADO DE KARSK · NÍVEL '+c.level+'</div><div style="margin:6px 0 12px">';
+  Object.keys(CITY_STAT_LABEL).forEach(k=>{ html += cityBarHTML(CITY_STAT_LABEL[k], c[k]||0, k==='lob' ? '#6fb194' : (k==='chaos' ? '#b34e4e' : '#d29e51')); });
+  if (STATE.role==='admin' && c.entities){
+    html += '<div class="live-meta" style="margin-top:10px">INFLUÊNCIA DAS ENTIDADES (só o admin vê)</div>';
+    MISSION_ENTITY_NAMES.forEach(n=>{ html += cityBarHTML(n, c.entities[n]||0, '#8d75c1'); });
+  }
+  html += '</div>';
+  if (STATE.role==='admin') html += '<div class="live-admin-actions"><button data-campaign-adjust="1">AJUSTAR ESTADO</button><button data-campaign-advance="1">▶ AVANÇAR NÍVEL</button><button data-campaign-log="1">📜 HISTÓRICO</button></div>';
+  return html;
+}
+function alertsBannerHTML(){
+  if (STATE.role!=='admin' || !LIVE_STATE.alerts.length) return '';
+  return LIVE_STATE.alerts.map(a=>
+    '<div class="live-row" style="border-color:var(--danger)"><span><strong>⚠ CONDIÇÃO CRÍTICA DETECTADA</strong><br>'+liveText(a.reason)+' — emergência: <em>'+liveText(a.missionTitle||'')+'</em></span>'+
+    '<span class="live-meta"><button class="live-del-btn" data-alert-activate="'+liveText(a.id)+'">ATIVAR EMERGÊNCIA</button><br>'+
+    '<button class="live-del-btn" data-alert-activate-vote="'+liveText(a.id)+'">ATIVAR COM VOTAÇÃO</button><br>'+
+    '<button class="live-del-btn" data-alert-dismiss="'+liveText(a.id)+'">IGNORAR / ADIAR</button></span></div>'
+  ).join('');
+}
 
 function renderMissionsTabHTML(){
-  if (!ONLINE_API_BASE) return '<div class="live-empty">A votação de missões precisa do backend online (parâmetro ?api=) — ela depende de coordenar votos entre agentes em tempo real.</div>';
-  let html = '';
+  if (!ONLINE_API_BASE) return '<div class="live-empty">As missões precisam do backend online (parâmetro ?api=) — elas dependem de coordenar votos e o estado da campanha entre os agentes.</div>';
+  let html = campaignPanelHTML() + alertsBannerHTML();
   const round = LIVE_STATE.missionRound;
   if (round && round.status==='voting'){
     const totalVotes = Object.values(LIVE_STATE.missionTally).reduce((a,b)=>a+b,0);
@@ -1982,10 +2050,11 @@ function renderMissionsTabHTML(){
     const winner = LIVE_STATE.roundMissions.find(m=>m.id===round.winnerMissionId);
     html += '<div class="live-meta">VOTAÇÃO #'+round.number+' ENCERRADA</div>';
     if (winner) html += missionAgentCardHTML(winner, true);
-  } else if (STATE.role!=='admin'){
-    html += LIVE_STATE.activeMission ? ('<div class="live-meta">CASO ATIVO</div>'+missionAgentCardHTML(LIVE_STATE.activeMission,false)) : '<div class="live-empty">NENHUMA VOTAÇÃO E NENHUM CASO ATIVO NO MOMENTO.</div>';
   }
+  const active = LIVE_STATE.activeMissions||[];
   if (STATE.role==='admin'){
+    html += '<div class="live-meta" style="margin-top:12px">CASOS ATIVOS ('+active.length+')</div>';
+    html += active.length ? active.map(m=>missionAdminRowHTML(m)).join('') : '<div class="live-empty">NENHUM CASO ATIVO.</div>';
     html += '<div class="live-admin-actions" style="margin-top:14px">'+
       '<select id="mission-level-select">'+Array.from({length:10},(_,i)=>'<option value="'+(i+1)+'" '+(LIVE_STATE.missionLevel===i+1?'selected':'')+'>NÍVEL '+(i+1)+'</option>').join('')+'</select>'+
       '<button data-mission-generate="1">🎲 GERAR MISSÕES</button>'+
@@ -1993,18 +2062,65 @@ function renderMissionsTabHTML(){
       ((!round || round.status!=='voting') ? '<button data-mission-open-round="1">ABRIR VOTAÇÃO COM SELECIONADAS</button>' : '')+
       '</div>';
     html += '<div class="live-meta" style="margin-top:8px">MISSÕES DO NÍVEL '+LIVE_STATE.missionLevel+'</div>';
-    html += LIVE_STATE.missions.length ? LIVE_STATE.missions.map(m=>missionAdminRowHTML(m)).join('') : '<div class="live-empty">NENHUMA MISSÃO NESTE NÍVEL AINDA.</div>';
+    const others = LIVE_STATE.missions.filter(m=>m.status!=='active');
+    html += others.length ? others.map(m=>missionAdminRowHTML(m)).join('') : '<div class="live-empty">NENHUMA MISSÃO NESTE NÍVEL AINDA.</div>';
+  } else {
+    html += '<div class="live-meta" style="margin-top:12px">CASOS ATIVOS ('+active.length+')</div>';
+    html += active.length ? active.map(m=>missionAgentCardHTML(m,false)).join('') : (round && round.status==='voting' ? '' : '<div class="live-empty">NENHUM CASO ATIVO NO MOMENTO.</div>');
   }
   return html;
 }
 
+/* ---------- painéis laterais auxiliares ---------- */
+function openCampaignNotesPanel(title, notes){
+  const html = '<div class="admin-form-head"><div class="afh-eyebrow">L.O.B. // CAMPANHA</div><div class="afh-title">'+escapeHTML(title)+'</div></div>'+
+    '<div class="admin-form-body">'+
+    (notes.length ? notes.map(n=>'<div class="audit-row">'+escapeHTML(n)+'</div>').join('') : '<div class="mut">Nada de relevante aconteceu.</div>')+
+    '<div class="admin-btn-row" style="margin-top:14px"><button class="admin-btn" id="cn-close">FECHAR</button></div></div>';
+  adminFormPanelEl.innerHTML = html; adminFormPanelEl.classList.add('open');
+  document.getElementById('cn-close').addEventListener('click', closeAdminForm);
+}
+async function openCampaignLogPanel(){
+  let entries = [];
+  try{ entries = (await onlineRequest('/campaign/log?limit=150')).entries||[]; }catch(e){}
+  const html = '<div class="admin-form-head"><div class="afh-eyebrow">L.O.B. // CAMPANHA</div><div class="afh-title">HISTÓRICO DA CAMPANHA</div></div>'+
+    '<div class="admin-form-body">'+
+    (entries.length ? entries.map(e=>'<div class="audit-row"><strong>'+(CAMPAIGN_LOG_ICON[e.kind]||'•')+' NÍVEL '+e.level+'</strong> · '+escapeHTML(e.text)+'<br>'+new Date(e.created_at).toLocaleString('pt-BR')+'</div>').join('') : '<div class="mut">Nenhum acontecimento registrado ainda.</div>')+
+    '<div class="admin-btn-row" style="margin-top:14px"><button class="admin-btn" id="cl-close">FECHAR</button></div></div>';
+  adminFormPanelEl.innerHTML = html; adminFormPanelEl.classList.add('open');
+  document.getElementById('cl-close').addEventListener('click', closeAdminForm);
+}
+function openCampaignAdjustPanel(){
+  const c = LIVE_STATE.campaign; if (!c) return;
+  const stat = k => '<div class="admin-field"><label>'+CITY_STAT_LABEL[k]+'</label><input type="number" min="0" max="100" id="ca-'+k+'" value="'+(c[k]||0)+'"></div>';
+  const html = '<div class="admin-form-head"><div class="afh-eyebrow">L.O.B. // CAMPANHA</div><div class="afh-title">AJUSTAR ESTADO DE KARSK</div></div>'+
+    '<div class="admin-form-body"><div class="admin-hint">Use para corrigir a campanha na mão. Gatilhos e emergências são reavaliados ao salvar.</div>'+
+    '<div class="admin-field"><label>NÍVEL (1-10)</label><input type="number" min="1" max="10" id="ca-level" value="'+c.level+'"></div>'+
+    Object.keys(CITY_STAT_LABEL).map(stat).join('')+
+    '<div class="cap" style="margin-top:10px">ENTIDADES</div>'+
+    MISSION_ENTITY_NAMES.map(n=>'<div class="admin-field"><label>'+n+'</label><input type="number" min="0" max="100" data-ca-entity="'+n+'" value="'+((c.entities||{})[n]||0)+'"></div>').join('')+
+    '<div class="admin-btn-row"><button class="admin-btn primary" id="ca-save">SALVAR</button><button class="admin-btn" id="ca-cancel">CANCELAR</button></div></div>';
+  adminFormPanelEl.innerHTML = html; adminFormPanelEl.classList.add('open');
+  document.getElementById('ca-cancel').addEventListener('click', closeAdminForm);
+  document.getElementById('ca-save').addEventListener('click', async ()=>{
+    const payload = { level:Number(document.getElementById('ca-level').value)||1, entities:{} };
+    Object.keys(CITY_STAT_LABEL).forEach(k=>{ payload[k] = Number(document.getElementById('ca-'+k).value)||0; });
+    adminFormPanelEl.querySelectorAll('[data-ca-entity]').forEach(inp=>{ payload.entities[inp.dataset.caEntity] = Number(inp.value)||0; });
+    let data; try{ data = await onlineRequest('/campaign', {method:'PUT', body:JSON.stringify(payload)}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível salvar o estado.'); return; }
+    await refreshCampaign(); renderLivePanel();
+    if (data.notes && data.notes.length) openCampaignNotesPanel('O QUE ACONTECEU', data.notes); else closeAdminForm();
+  });
+}
+
+/* ---------- ligação dos botões da aba ---------- */
 function wireMissionsTabButtons(body){
   const levelSel = body.querySelector('#mission-level-select');
   if (levelSel) levelSel.addEventListener('change', async ()=>{ LIVE_STATE.missionLevel = Number(levelSel.value); await refreshMissionList(); renderLivePanel(); });
   const genBtn = body.querySelector('[data-mission-generate]');
   if (genBtn) genBtn.addEventListener('click', async ()=>{
     const count = Math.max(1, Math.min(5, Number(prompt('Quantas missões gerar? (1 a 5)', '3'))||3));
-    try{ await onlineRequest('/missions/generate', {method:'POST', body:JSON.stringify({count, level:LIVE_STATE.missionLevel, city:{chaos:STATE.chaos||0}})}); playAudio('confirm'); }
+    try{ await onlineRequest('/missions/generate', {method:'POST', body:JSON.stringify({count, level:LIVE_STATE.missionLevel})}); playAudio('confirm'); }
     catch(e){ alert('Não foi possível gerar as missões.'); }
     await refreshMissionList(); renderLivePanel();
   });
@@ -2023,7 +2139,7 @@ function wireMissionsTabButtons(body){
     if (!window.confirm('Encerrar a votação agora? A mais votada vira a missão ativa; as outras continuam existindo como ignoradas.')) return;
     try{ await onlineRequest('/missions/rounds/'+LIVE_STATE.missionRound.number+'/close', {method:'POST'}); playAudio('confirm'); }
     catch(e){ alert('Não foi possível fechar a votação.'); }
-    await refreshMissionRound(); await refreshMissionList(); renderLivePanel();
+    await refreshCampaign(); await refreshMissionRound(); await refreshMissionList(); renderLivePanel();
   });
   body.querySelectorAll('[data-mission-vote]').forEach(btn=> btn.addEventListener('click', async ()=>{
     try{ await onlineRequest('/missions/rounds/'+LIVE_STATE.missionRound.number+'/vote', {method:'POST', body:JSON.stringify({missionId:btn.dataset.missionVote})}); playAudio('select'); }
@@ -2037,10 +2153,46 @@ function wireMissionsTabButtons(body){
   body.querySelectorAll('[data-mission-delete]').forEach(btn=> btn.addEventListener('click', async ()=>{
     if (!window.confirm('Excluir esta missão permanentemente?')) return;
     try{ await onlineRequest('/missions/'+btn.dataset.missionDelete, {method:'DELETE'}); }catch(e){}
-    await refreshMissionList(); renderLivePanel();
+    await refreshMissionList(); await refreshMissionRound(); renderLivePanel();
+  }));
+  body.querySelectorAll('[data-mission-resolve]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    const sep = btn.dataset.missionResolve.indexOf(':');
+    const outcome = btn.dataset.missionResolve.slice(0,sep), id = btn.dataset.missionResolve.slice(sep+1);
+    if (!window.confirm((outcome==='completed'?'Marcar como CONCLUÍDA':'Marcar como FRACASSADA')+'? As consequências serão aplicadas ao estado de Karsk.')) return;
+    let data; try{ data = await onlineRequest('/missions/'+id+'/resolve', {method:'POST', body:JSON.stringify({outcome})}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível registrar o resultado.'); return; }
+    await refreshCampaign(); await refreshMissionRound(); await refreshMissionList(); renderLivePanel();
+    openCampaignNotesPanel('RESULTADO DA MISSÃO', data.notes||[]);
+  }));
+  const adjustBtn = body.querySelector('[data-campaign-adjust]');
+  if (adjustBtn) adjustBtn.addEventListener('click', openCampaignAdjustPanel);
+  const logBtn = body.querySelector('[data-campaign-log]');
+  if (logBtn) logBtn.addEventListener('click', openCampaignLogPanel);
+  const advBtn = body.querySelector('[data-campaign-advance]');
+  if (advBtn) advBtn.addEventListener('click', async ()=>{
+    if (!window.confirm('Avançar para o próximo nível? Os casos ignorados vão piorar e podem gerar consequências.')) return;
+    let data; try{ data = await onlineRequest('/campaign/advance', {method:'POST'}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível avançar o nível (já está no 10?).'); return; }
+    LIVE_STATE.missionLevel = data.campaign.level;
+    await refreshCampaign(); await refreshMissionRound(); await refreshMissionList(); renderLivePanel();
+    openCampaignNotesPanel('NÍVEL '+data.campaign.level+' — O QUE ACONTECEU', data.notes||[]);
+  });
+  const afterAlert = async ()=>{ await refreshCampaign(); await refreshMissionRound(); await refreshMissionList(); renderLivePanel(); };
+  body.querySelectorAll('[data-alert-activate]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    try{ await onlineRequest('/campaign/alerts/'+btn.dataset.alertActivate+'/activate', {method:'POST', body:JSON.stringify({withVote:false})}); playAudio('confirm'); }catch(e){ alert('Não foi possível ativar.'); }
+    await afterAlert();
+  }));
+  body.querySelectorAll('[data-alert-activate-vote]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    try{ await onlineRequest('/campaign/alerts/'+btn.dataset.alertActivateVote+'/activate', {method:'POST', body:JSON.stringify({withVote:true})}); playAudio('confirm'); }catch(e){ alert('Não foi possível ativar.'); }
+    await afterAlert();
+  }));
+  body.querySelectorAll('[data-alert-dismiss]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    try{ await onlineRequest('/campaign/alerts/'+btn.dataset.alertDismiss+'/dismiss', {method:'POST'}); }catch(e){ alert('Não foi possível adiar.'); }
+    await afterAlert();
   }));
 }
 
+/* ---------- criar missão manualmente ---------- */
 function openMissionCreateForm(){
   const html = '<div class="admin-form-head"><div class="afh-eyebrow">NOVA MISSÃO</div><div class="afh-title">CRIAR MANUALMENTE</div></div>'+
     '<div class="admin-form-body">'+
@@ -2048,6 +2200,8 @@ function openMissionCreateForm(){
     '<div class="admin-field"><label>TIPO</label><input id="mc-type" placeholder="ex: Desaparecimento"></div>'+
     '<div class="admin-field"><label>LOCAL</label><input id="mc-loc" placeholder="ex: Metrô"></div>'+
     '<div class="admin-field"><label>NÍVEL</label><input id="mc-level" type="number" min="1" max="10" value="'+LIVE_STATE.missionLevel+'"></div>'+
+    '<div class="admin-field"><label>TIPO DE MISSÃO</label><select id="mc-kind"><option value="normal">Normal</option><option value="emergencial">Emergência crítica</option></select></div>'+
+    '<div class="admin-field"><label>SITUAÇÃO INICIAL</label><select id="mc-status"><option value="draft">Rascunho (pronta pra votação)</option><option value="locked">Bloqueada (só um gatilho libera)</option></select></div>'+
     '<div class="admin-field"><label>RESUMO PARA O AGENTE (sem spoiler)</label><textarea id="mc-summary-agent" rows="2"></textarea></div>'+
     '<div class="admin-field"><label>VISÃO DO MESTRE (o que realmente está acontecendo)</label><textarea id="mc-summary-gm" rows="3"></textarea></div>'+
     '<div class="admin-btn-row"><button class="admin-btn primary" id="mc-save">CRIAR</button><button class="admin-btn" id="mc-cancel">CANCELAR</button></div>'+
@@ -2060,8 +2214,9 @@ function openMissionCreateForm(){
       title: document.getElementById('mc-title').value.trim() || 'SEM TÍTULO',
       type: document.getElementById('mc-type').value.trim(), loc: document.getElementById('mc-loc').value.trim(),
       level: Number(document.getElementById('mc-level').value)||1,
-      summaryAgent: document.getElementById('mc-summary-agent').value, summaryGm: document.getElementById('mc-summary-gm').value,
-      status: 'draft'
+      kind: document.getElementById('mc-kind').value, status: document.getElementById('mc-status').value,
+      priority: document.getElementById('mc-kind').value==='emergencial' ? 'critica' : 'normal',
+      summaryAgent: document.getElementById('mc-summary-agent').value, summaryGm: document.getElementById('mc-summary-gm').value
     };
     try{ await onlineRequest('/missions', {method:'POST', body:JSON.stringify(payload)}); playAudio('confirm'); }
     catch(e){ alert('Não foi possível criar a missão.'); return; }
@@ -2070,10 +2225,11 @@ function openMissionCreateForm(){
   });
 }
 
+/* ---------- detalhe da missão: visão do mestre, consequências, gatilhos, pistas ---------- */
 function consequenceRowHTML(label, key, consequences){
-  const c = (consequences && consequences[key]) || {chaos:0,crime:0,entity:0,lob:0};
-  return '<div class="mut" style="font-size:10px;margin-top:6px">'+label+' (caos / criminalidade / entidade / L.O.B.)</div>'+
-    '<div style="display:flex;gap:5px">'+['chaos','crime','entity','lob'].map(k=>'<input type="number" data-cons="'+key+':'+k+'" value="'+(c[k]||0)+'" style="width:60px">').join('')+'</div>';
+  const c = (consequences && consequences[key]) || {};
+  return '<div class="mut" style="font-size:10px;margin-top:8px">'+label+'</div><div style="display:flex;gap:5px;flex-wrap:wrap">'+
+    CONS_FIELDS.map(([k,l])=>'<label style="font-size:9px">'+l+'<br><input type="number" data-cons="'+key+':'+k+'" value="'+(c[k]||0)+'" style="width:58px"></label>').join('')+'</div>';
 }
 function cluesListHTML(m){
   return (m.clues||[]).map(c=>
@@ -2083,16 +2239,44 @@ function cluesListHTML(m){
     '</div></div>'
   ).join('') || '<div class="mut">Nenhuma pista ainda.</div>';
 }
-function openMissionDetailPanel(id){
-  const m = LIVE_STATE.missions.find(x=>x.id===id);
+function describeTrigger(t, all){
+  const when = TRIGGER_WHEN_LABEL[t.when]||t.when;
+  const cond = String(t.when).endsWith('_gte') ? (when+' '+t.value+(t.when==='entity_gte' ? ' ('+t.entity+')' : '')) : when;
+  let act = TRIGGER_ACTION_LABEL[t.action]||t.action;
+  if (t.action==='unlock_mission'){ const tm = all.find(x=>x.id===t.targetMissionId); act += ' "'+(tm ? tm.title : '?')+'"'; }
+  if (t.action==='stat_delta') act += ': '+(Object.keys(t.delta||{}).filter(k=>t.delta[k]).map(k=>k+' '+(t.delta[k]>0?'+':'')+t.delta[k]).join(', ')||'—');
+  return cond+' → '+act+(t.fired ? ' ✔ já disparou' : '');
+}
+function triggersSectionHTML(m, all){
+  const others = all.filter(x=>x.id!==m.id);
+  const secretClues = (m.clues||[]).filter(c=>c.visibility==='secreto');
+  const list = (m.triggers||[]).map((t,i)=>'<div class="locker-row" style="padding:8px 10px;margin-bottom:6px"><div class="locker-row-head"><span>'+escapeHTML(describeTrigger(t, all))+'</span><div class="locker-row-actions"><button data-trigger-del="'+i+'">REMOVER</button></div></div></div>').join('') || '<div class="mut">Nenhum gatilho.</div>';
+  return '<div style="margin-top:14px">GATILHOS</div><div class="mut" style="font-size:10px;margin-bottom:6px">Transformam a missão numa cadeia viva: concluir, fracassar ou ignorar (ou o estado de Karsk passar de um limite) dispara uma consequência.</div>'+
+    '<div id="md-triggers">'+list+'</div>'+
+    '<div class="mut" style="font-size:10px;margin-top:10px">NOVO GATILHO</div>'+
+    '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end">'+
+    '<select id="tg-when">'+Object.keys(TRIGGER_WHEN_LABEL).map(k=>'<option value="'+k+'">'+TRIGGER_WHEN_LABEL[k]+'</option>').join('')+'</select>'+
+    '<input id="tg-value" type="number" value="60" style="width:64px;display:none">'+
+    '<select id="tg-entity" style="display:none">'+MISSION_ENTITY_NAMES.map(n=>'<option>'+n+'</option>').join('')+'</select>'+
+    '<select id="tg-action">'+Object.keys(TRIGGER_ACTION_LABEL).map(k=>'<option value="'+k+'">'+TRIGGER_ACTION_LABEL[k]+'</option>').join('')+'</select>'+
+    '<select id="tg-target">'+(others.map(x=>'<option value="'+liveText(x.id)+'">'+escapeHTML((x.status==='locked'?'🔒 ':'')+x.title)+'</option>').join('')||'<option value="">(nenhuma outra missão)</option>')+'</select>'+
+    '<select id="tg-clue" style="display:none">'+(secretClues.map(c=>'<option value="'+liveText(c.id)+'">'+escapeHTML(c.text.slice(0,48))+'</option>').join('')||'<option value="">(esta missão não tem pistas secretas)</option>')+'</select>'+
+    '<span id="tg-delta" style="display:none">'+['chaos','crime','anomalies','conflict','entity','lob'].map(k=>'<label style="font-size:9px">'+k+'<br><input type="number" data-tgd="'+k+'" value="0" style="width:52px"></label>').join(' ')+'</span>'+
+    '<button class="admin-btn" id="tg-add">+ ADICIONAR GATILHO</button></div>';
+}
+async function openMissionDetailPanel(id){
+  await refreshAllMissions();
+  const m = (LIVE_STATE.allMissions||[]).find(x=>x.id===id) || LIVE_STATE.missions.find(x=>x.id===id) || (LIVE_STATE.activeMissions||[]).find(x=>x.id===id);
   if (m) renderMissionDetailPanel(m);
 }
 function renderMissionDetailPanel(m){
-  const html = '<div class="admin-form-head"><div class="afh-eyebrow">MISSÃO'+(m.code?' ['+escapeHTML(m.code)+']':'')+' · NÍVEL '+m.level+'</div><div class="afh-title">'+escapeHTML(m.title)+'</div></div>'+
+  const all = LIVE_STATE.allMissions||[];
+  const html = '<div class="admin-form-head"><div class="afh-eyebrow">MISSÃO'+(m.code?' ['+escapeHTML(m.code)+']':'')+' · NÍVEL '+m.level+(m.kind==='emergencial'?' · 🚨 EMERGÊNCIA':'')+'</div><div class="afh-title">'+escapeHTML(m.title)+'</div></div>'+
     '<div class="admin-form-body">'+
     '<div class="admin-field"><label>TÍTULO</label><input id="md-title" value="'+escapeHTML(m.title)+'"></div>'+
     '<div class="admin-field"><label>TIPO</label><input id="md-type" value="'+escapeHTML(m.type||'')+'"></div>'+
     '<div class="admin-field"><label>LOCAL</label><input id="md-loc" value="'+escapeHTML(m.loc||'')+'"></div>'+
+    '<div class="admin-field"><label>TIPO DE MISSÃO</label><select id="md-kind"><option value="normal" '+(m.kind!=='emergencial'?'selected':'')+'>Normal</option><option value="emergencial" '+(m.kind==='emergencial'?'selected':'')+'>Emergência crítica</option></select></div>'+
     '<div class="admin-field"><label>PRIORIDADE</label><select id="md-priority">'+Object.keys(MISSION_PRIORITY_LABEL).map(p=>'<option value="'+p+'" '+(m.priority===p?'selected':'')+'>'+MISSION_PRIORITY_LABEL[p]+'</option>').join('')+'</select></div>'+
     '<div class="admin-field"><label>STATUS</label><select id="md-status">'+Object.keys(MISSION_STATUS_LABEL).map(s=>'<option value="'+s+'" '+(m.status===s?'selected':'')+'>'+MISSION_STATUS_LABEL[s]+'</option>').join('')+'</select></div>'+
     '<div class="admin-field"><label>RESUMO PARA O AGENTE (sem spoiler)</label><textarea id="md-summary-agent" rows="3">'+escapeHTML(m.summaryAgent||'')+'</textarea></div>'+
@@ -2102,10 +2286,11 @@ function renderMissionDetailPanel(m){
     '<div class="admin-field"><label>COMO SE DESENVOLVE</label><textarea id="md-development" rows="3">'+escapeHTML(m.development||'')+'</textarea></div>'+
     '<div class="admin-field"><label>CLÍMAX / DESCOBERTA</label><textarea id="md-climax" rows="2">'+escapeHTML(m.climax||'')+'</textarea></div>'+
     '<div class="admin-field"><label>DESFECHOS POSSÍVEIS</label>'+(m.outcomes||[]).map(o=>'<div class="mut" style="font-size:11px;margin:3px 0"><b>'+escapeHTML(o.label)+':</b> '+escapeHTML(o.text)+'</div>').join('')+'</div>'+
-    '<div class="admin-field"><label>CONSEQUÊNCIAS</label>'+consequenceRowHTML('Se concluída','completed',m.consequences)+consequenceRowHTML('Se ignorada','ignored',m.consequences)+consequenceRowHTML('Se fracassada','failed',m.consequences)+'</div>'+
+    '<div class="admin-field"><label>CONSEQUÊNCIAS (efeito no estado de Karsk)</label>'+consequenceRowHTML('Se concluída','completed',m.consequences)+consequenceRowHTML('Se ignorada (a cada nível em que continuar ignorada)','ignored',m.consequences)+consequenceRowHTML('Se fracassada','failed',m.consequences)+'</div>'+
     '<div style="margin-top:14px">PISTAS DA INVESTIGAÇÃO</div>'+
     '<div id="md-clues">'+cluesListHTML(m)+'</div>'+
     '<div class="admin-btn-row" style="margin-top:6px"><button class="admin-btn" id="md-add-clue">+ ADICIONAR PISTA</button></div>'+
+    triggersSectionHTML(m, all)+
     '<div class="admin-btn-row" style="margin-top:18px"><button class="admin-btn primary" id="md-save">SALVAR</button><button class="admin-btn" id="md-close">FECHAR</button></div>'+
     '</div>';
   adminFormPanelEl.innerHTML = html;
@@ -2113,19 +2298,25 @@ function renderMissionDetailPanel(m){
   wireMissionDetailPanel(m);
 }
 function wireMissionDetailPanel(m){
+  const reopen = async ()=>{
+    await refreshAllMissions(); await refreshMissionList();
+    const updated = (LIVE_STATE.allMissions||[]).find(x=>x.id===m.id);
+    if (updated) renderMissionDetailPanel(updated);
+    renderLivePanel();
+  };
   document.getElementById('md-close').addEventListener('click', closeAdminForm);
   document.getElementById('md-save').addEventListener('click', async ()=>{
     const consequences = {};
     ['completed','ignored','failed'].forEach(key=>{
       consequences[key] = {};
-      ['chaos','crime','entity','lob'].forEach(k=>{
+      CONS_FIELDS.forEach(([k])=>{
         const el = document.querySelector('[data-cons="'+key+':'+k+'"]');
         consequences[key][k] = el ? Number(el.value)||0 : 0;
       });
     });
     const payload = {
       title: document.getElementById('md-title').value.trim(), type: document.getElementById('md-type').value.trim(),
-      loc: document.getElementById('md-loc').value.trim(), priority: document.getElementById('md-priority').value,
+      loc: document.getElementById('md-loc').value.trim(), kind: document.getElementById('md-kind').value, priority: document.getElementById('md-priority').value,
       status: document.getElementById('md-status').value, summaryAgent: document.getElementById('md-summary-agent').value,
       summaryGm: document.getElementById('md-summary-gm').value, hook: document.getElementById('md-hook').value,
       development: document.getElementById('md-development').value, climax: document.getElementById('md-climax').value,
@@ -2134,7 +2325,7 @@ function wireMissionDetailPanel(m){
     try{ await onlineRequest('/missions/'+m.id, {method:'PUT', body:JSON.stringify(payload)}); playAudio('confirm'); }
     catch(e){ alert('Não foi possível salvar.'); return; }
     closeAdminForm();
-    await refreshMissionList(); renderLivePanel();
+    await refreshMissionList(); await refreshMissionRound(); renderLivePanel();
   });
   document.getElementById('md-add-clue').addEventListener('click', async ()=>{
     const text = prompt('Texto da pista:'); if (!text) return;
@@ -2142,27 +2333,54 @@ function wireMissionDetailPanel(m){
     const visibility = window.confirm('Esta pista é SECRETA (só o admin vê)? OK = secreta, Cancelar = pública.') ? 'secreto' : 'publico';
     try{ await onlineRequest('/missions/'+m.id+'/clues', {method:'POST', body:JSON.stringify({text, category, visibility})}); }
     catch(e){ alert('Não foi possível adicionar a pista.'); return; }
-    await refreshMissionList();
-    const updated = LIVE_STATE.missions.find(x=>x.id===m.id);
-    if (updated) renderMissionDetailPanel(updated);
+    await reopen();
   });
   adminFormPanelEl.querySelectorAll('[data-clue-toggle]').forEach(btn=> btn.addEventListener('click', async ()=>{
     const clue = (m.clues||[]).find(c=>c.id===btn.dataset.clueToggle);
     if (!clue) return;
     const newVis = clue.visibility==='secreto' ? 'publico' : 'secreto';
     try{ await onlineRequest('/missions/clues/'+btn.dataset.clueToggle, {method:'PUT', body:JSON.stringify({visibility:newVis})}); }catch(e){}
-    clue.visibility = newVis;
-    renderMissionDetailPanel(m);
+    await reopen();
   }));
   adminFormPanelEl.querySelectorAll('[data-clue-delete]').forEach(btn=> btn.addEventListener('click', async ()=>{
     if (!window.confirm('Excluir esta pista?')) return;
     try{ await onlineRequest('/missions/clues/'+btn.dataset.clueDelete, {method:'DELETE'}); }catch(e){}
-    m.clues = (m.clues||[]).filter(c=>c.id!==btn.dataset.clueDelete);
-    renderMissionDetailPanel(m);
-    await refreshMissionList();
+    await reopen();
+  }));
+
+  // gatilhos
+  const when = document.getElementById('tg-when'), action = document.getElementById('tg-action');
+  const syncTriggerForm = ()=>{
+    const isGte = when.value.endsWith('_gte');
+    document.getElementById('tg-value').style.display = isGte ? '' : 'none';
+    document.getElementById('tg-entity').style.display = when.value==='entity_gte' ? '' : 'none';
+    document.getElementById('tg-target').style.display = action.value==='unlock_mission' ? '' : 'none';
+    document.getElementById('tg-clue').style.display = action.value==='reveal_clue' ? '' : 'none';
+    document.getElementById('tg-delta').style.display = action.value==='stat_delta' ? '' : 'none';
+  };
+  when.addEventListener('change', syncTriggerForm); action.addEventListener('change', syncTriggerForm); syncTriggerForm();
+  document.getElementById('tg-add').addEventListener('click', async ()=>{
+    const t = { id:'t-'+Date.now().toString(36), when:when.value, action:action.value, fired:false };
+    if (when.value.endsWith('_gte')) t.value = Number(document.getElementById('tg-value').value)||0;
+    if (when.value==='entity_gte') t.entity = document.getElementById('tg-entity').value;
+    if (action.value==='unlock_mission'){ t.targetMissionId = document.getElementById('tg-target').value; if (!t.targetMissionId){ alert('Escolha qual missão será desbloqueada.'); return; } }
+    if (action.value==='reveal_clue'){ t.clueId = document.getElementById('tg-clue').value; if (!t.clueId){ alert('Esta missão não tem pistas secretas pra liberar.'); return; } }
+    if (action.value==='stat_delta'){
+      t.delta = {};
+      adminFormPanelEl.querySelectorAll('[data-tgd]').forEach(inp=>{ const v = Number(inp.value)||0; if (v) t.delta[inp.dataset.tgd] = v; });
+      if (!Object.keys(t.delta).length){ alert('Informe ao menos um efeito (ex.: criminalidade +5).'); return; }
+    }
+    try{ await onlineRequest('/missions/'+m.id, {method:'PUT', body:JSON.stringify({triggers:(m.triggers||[]).concat(t)})}); playAudio('confirm'); }
+    catch(e){ alert('Não foi possível adicionar o gatilho.'); return; }
+    await reopen();
+  });
+  adminFormPanelEl.querySelectorAll('[data-trigger-del]').forEach(btn=> btn.addEventListener('click', async ()=>{
+    const idx = Number(btn.dataset.triggerDel);
+    const next = (m.triggers||[]).filter((_,i)=>i!==idx);
+    try{ await onlineRequest('/missions/'+m.id, {method:'PUT', body:JSON.stringify({triggers:next})}); }catch(e){ alert('Não foi possível remover.'); return; }
+    await reopen();
   }));
 }
-
 
 async function deleteLiveRecord(kind, id){
   if (STATE.role!=='admin') return;
@@ -3214,6 +3432,7 @@ function saveTriggeredWorldEvents(){ Store.set(TRIGGERED_WORLD_EVENTS_KEY, JSON.
 
 function syncWorldEventFeed(){
   if (!KARSK_EVENTS.length) return;
+  if (ONLINE_API_BASE && STATE.role!=='admin') return; // só o admin consegue gravar no armazenamento compartilhado
   const active = KARSK_EVENTS.filter(evt => !TRIGGERED_WORLD_EVENTS.has(evt.id));
   if (!active.length || Math.random() > 0.26) return;
   const evt = active[Math.floor(Math.random()*active.length)];
@@ -3236,7 +3455,7 @@ function syncWorldEventFeed(){
   savePersistentNews();
   if (typeof buildTickerContent === 'function') buildTickerContent();
   if (typeof renderNewsPanel === 'function') renderNewsPanel();
-  STATE.chaos = Math.min(100, STATE.chaos + evt.chaosDelta);
+  if (!(ONLINE_API_BASE && LIVE_STATE.campaign)) STATE.chaos = Math.min(100, STATE.chaos + evt.chaosDelta);
 }
 
 const KARSK_BACKEND = {
@@ -5376,8 +5595,8 @@ function startWorldClock(){
     hudClockEl.textContent = formatKarskTime();
 
     // chaos drifts slowly
-    STATE.chaos += (Math.random()-0.48)*1.4;
-    STATE.chaos = Math.max(4, Math.min(96, STATE.chaos));
+    if (ONLINE_API_BASE && LIVE_STATE.campaign){ STATE.chaos = LIVE_STATE.campaign.chaos; }
+    else { STATE.chaos += (Math.random()-0.48)*1.4; STATE.chaos = Math.max(4, Math.min(96, STATE.chaos)); }
     chaosValueEl.textContent = Math.round(STATE.chaos)+'%';
     chaosFillEl.style.width = STATE.chaos+'%';
     chaosFillEl.style.background = STATE.chaos>65 ? 'var(--danger)' : (STATE.chaos>38 ? 'var(--phosphor)' : 'var(--brass-bright)');
