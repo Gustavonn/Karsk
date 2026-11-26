@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@libsql/client';
+import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 
 const app = express();
@@ -23,6 +24,30 @@ const secureCookies = process.env.NODE_ENV === 'production';
 
 app.use(cors({ origin(origin, callback) { callback(null, !origin || allowedOrigins.includes(origin)); }, credentials: true }));
 app.use(express.json({ limit: '8mb' }));
+
+// Respostas JSON grandes (snapshot, missões) vão comprimidas quando o navegador aceita gzip —
+// bem menos dados trafegando a cada atualização, principalmente no celular.
+app.use((req, res, next) => {
+  const original = res.json.bind(res);
+  res.json = (obj) => {
+    const body = JSON.stringify(obj);
+    res.type('application/json');
+    if (body.length < 1024 || !/\bgzip\b/.test(req.get('accept-encoding') || '')) return res.send(body);
+    zlib.gzip(body, (err, buf) => {
+      if (err) return res.send(body);
+      res.set('Content-Encoding', 'gzip'); res.set('Vary', 'Accept-Encoding');
+      res.send(buf);
+    });
+    return res;
+  };
+  next();
+});
+// Qualquer mudança em usuários ou sessões invalida o cache de autenticação na hora.
+const authCache = new Map();
+app.use((req, res, next) => {
+  if (req.method !== 'GET' && (req.path.startsWith('/api/users') || req.path.startsWith('/api/auth/'))) res.on('finish', () => authCache.clear());
+  next();
+});
 
 // Small helper so async route handlers don't need a try/catch each — Express 4
 // does not forward rejected promises to error handling on its own.
@@ -149,15 +174,22 @@ function cookieValue(req, name) {
   const found = header.split(';').map(item => item.trim()).find(item => item.startsWith(name+'='));
   return found ? decodeURIComponent(found.slice(name.length+1)) : '';
 }
+const AUTH_CACHE_MS = 20000;
 const auth = ah(async (req, res, next) => {
   const bearer = req.get('authorization')?.replace(/^Bearer\s+/i, '');
   const origin = req.get('origin');
   if (req.method !== 'GET' && origin && !allowedOrigins.includes(origin)) return res.status(403).json({ error: 'ORIGIN_NOT_ALLOWED' });
   const token = bearer || cookieValue(req, 'karsk_session');
-  const session = token && await get('SELECT * FROM sessions WHERE token_hash=? AND expires_at>?', [tokenHash(token), Date.now()]);
-  if (!session) return res.status(401).json({ error: 'AUTH_REQUIRED' });
+  if (!token) return res.status(401).json({ error: 'AUTH_REQUIRED' });
+  const th = tokenHash(token);
+  const hit = authCache.get(th);
+  if (hit && Date.now() - hit.at < AUTH_CACHE_MS && hit.expiresAt > Date.now()){ req.user = hit.user; req.token = token; return next(); }
+  const session = await get('SELECT * FROM sessions WHERE token_hash=? AND expires_at>?', [th, Date.now()]);
+  if (!session){ authCache.delete(th); return res.status(401).json({ error: 'AUTH_REQUIRED' }); }
   const row = await get('SELECT * FROM users WHERE username=?', [session.username]);
-  if (!row) return res.status(401).json({ error: 'AUTH_REQUIRED' });
+  if (!row){ authCache.delete(th); return res.status(401).json({ error: 'AUTH_REQUIRED' }); }
+  if (authCache.size > 500) authCache.clear();
+  authCache.set(th, { user: row, expiresAt: Number(session.expires_at), at: Date.now() });
   req.user = row; req.token = token; next();
 });
 function admin(req, res, next) { if (req.user.role !== 'admin') return res.status(403).json({ error: 'ADMIN_REQUIRED' }); next(); }
@@ -224,18 +256,21 @@ app.get('/api/live/stream', auth, (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('Connection', 'keep-alive'); res.flushHeaders();
   liveClients.add(res); res.write(`data: ${JSON.stringify({ type:'ready' })}\n\n`); req.on('close', () => liveClients.delete(res));
 });
-app.get('/api/live/snapshot', auth, ah(async (req, res) => {
-  const permissions=permissionsFor(req.user), allowed=new Set(permissions.allowedRegionIds||[]);
-  const visibleRegion=(regionId,districtId)=>req.user.role==='admin'||permissions.allRegions||(!regionId&&!districtId)||allowed.has(regionId)||allowed.has(districtId);
-  const presenceRows = await all('SELECT p.username AS userId, p.username AS agentId, u.display_name AS displayName, p.status, p.region_id AS regionId, p.district_id AS districtId, p.location_id AS locationId, p.online, p.visible_to_agents AS visibleToAgents, p.last_seen AS lastSeen FROM live_presence p LEFT JOIN users u ON u.username=p.username WHERE p.online=1 OR p.last_seen>?', [Date.now()-120000]);
-  const presence = presenceRows.filter(item => (req.user.role==='admin' || item.visibleToAgents) && visibleRegion(item.regionId,item.districtId));
-  const eventRows = await all('SELECT * FROM live_events WHERE active=1 ORDER BY created_at DESC LIMIT 100');
+async function buildSnapshot(user){
+  const permissions=permissionsFor(user), allowed=new Set(permissions.allowedRegionIds||[]);
+  const visibleRegion=(regionId,districtId)=>user.role==='admin'||permissions.allRegions||(!regionId&&!districtId)||allowed.has(regionId)||allowed.has(districtId);
+  const [presenceRows, eventRows, transmissionRows, states] = await Promise.all([
+    all('SELECT p.username AS userId, p.username AS agentId, u.display_name AS displayName, p.status, p.region_id AS regionId, p.district_id AS districtId, p.location_id AS locationId, p.online, p.visible_to_agents AS visibleToAgents, p.last_seen AS lastSeen FROM live_presence p LEFT JOIN users u ON u.username=p.username WHERE p.online=1 OR p.last_seen>?', [Date.now()-120000]),
+    all('SELECT * FROM live_events WHERE active=1 ORDER BY created_at DESC LIMIT 100'),
+    all('SELECT * FROM live_transmissions ORDER BY created_at DESC LIMIT 100'),
+    all('SELECT * FROM city_states ORDER BY timestamp DESC LIMIT 50')
+  ]);
+  const presence = presenceRows.filter(item => (user.role==='admin' || item.visibleToAgents) && visibleRegion(item.regionId,item.districtId));
   const events = eventRows.filter(item=>visibleRegion(item.region_id,item.district_id));
-  const transmissionRows = await all('SELECT * FROM live_transmissions ORDER BY created_at DESC LIMIT 100');
-  const transmissions = transmissionRows.filter(item=>item.scope==='GLOBAL'||req.user.role==='admin'||(item.scope==='REGIONAL'&&allowed.has(item.target_id))||(item.scope==='DISTRICT'&&allowed.has(item.target_id))||(item.scope==='PRIVATE'&&item.target_id===req.user.username));
-  const states = await all('SELECT * FROM city_states ORDER BY timestamp DESC LIMIT 50');
-  res.json({ presence, events, transmissions, states });
-}));
+  const transmissions = transmissionRows.filter(item=>item.scope==='GLOBAL'||user.role==='admin'||(item.scope==='REGIONAL'&&allowed.has(item.target_id))||(item.scope==='DISTRICT'&&allowed.has(item.target_id))||(item.scope==='PRIVATE'&&item.target_id===user.username));
+  return { presence, events, transmissions, states };
+}
+app.get('/api/live/snapshot', auth, ah(async (req, res) => res.json(await buildSnapshot(req.user))));
 app.put('/api/live/presence', auth, ah(async (req, res) => {
   const row = { status:String(req.body.status||'ONLINE'), regionId:req.body.regionId||null, districtId:req.body.districtId||null, locationId:req.body.locationId||null, online:req.body.online===false?0:1, visibleToAgents:req.body.visibleToAgents===false?0:1, lastSeen:Date.now() };
   await run('INSERT INTO live_presence VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET status=excluded.status, region_id=excluded.region_id, district_id=excluded.district_id, location_id=excluded.location_id, online=excluded.online, visible_to_agents=excluded.visible_to_agents, last_seen=excluded.last_seen', [req.user.username,row.status,row.regionId,row.districtId,row.locationId,row.online,row.visibleToAgents,row.lastSeen]);
@@ -439,7 +474,7 @@ async function getCampaign(){
   const base = DEFAULT_CAMPAIGN();
   const row = await get('SELECT state_json FROM campaign_state WHERE id=1');
   if (!row){
-    await run('INSERT INTO campaign_state VALUES (1, ?, ?)', [JSON.stringify(base), new Date().toISOString()]);
+    await run('INSERT OR IGNORE INTO campaign_state VALUES (1, ?, ?)', [JSON.stringify(base), new Date().toISOString()]);
     return base;
   }
   let saved = {}; try{ saved = JSON.parse(row.state_json||'{}'); }catch(e){}
@@ -710,17 +745,53 @@ async function applyVoteCloseEffects(round, missionIds, winnerMissionId, tallyRo
   for (const n of notes) await logCampaign(c.level, 'ignored', n);
 }
 
-app.get('/api/missions', auth, ah(async (req, res) => {
-  const isAdmin = req.user.role==='admin';
+// Antes: 1 consulta por missão pra buscar as pistas (33 idas ao banco p/ 15 missões). Agora: 1 consulta só.
+async function attachClues(rows, isAdmin){
+  if (!rows.length) return [];
+  const byMission = new Map();
+  for (let i=0; i<rows.length; i+=200){
+    const chunk = rows.slice(i, i+200).map(r=>r.id);
+    const clueRows = await all('SELECT * FROM mission_clues WHERE mission_id IN ('+chunk.map(()=>'?').join(',')+') ORDER BY order_idx, rowid', chunk);
+    clueRows.forEach(c => { if (!byMission.has(c.mission_id)) byMission.set(c.mission_id, []); byMission.get(c.mission_id).push(c); });
+  }
+  return rows.map(row => {
+    const m = publicMission(row, isAdmin);
+    m.clues = (byMission.get(row.id)||[]).map(c => publicClue(c, isAdmin)).filter(Boolean);
+    return m;
+  });
+}
+async function missionsByIds(ids, isAdmin){
+  if (!ids.length) return [];
+  const rows = await all('SELECT * FROM missions WHERE id IN ('+ids.map(()=>'?').join(',')+')', ids);
+  const byId = new Map(rows.map(r => [r.id, r]));
+  return attachClues(ids.map(id => byId.get(id)).filter(Boolean), isAdmin);
+}
+async function listMissions(user, { level, status }){
+  const isAdmin = user.role==='admin';
   let sql = 'SELECT * FROM missions WHERE 1=1'; const args = [];
-  if (req.query.level){ sql += ' AND level=?'; args.push(Number(req.query.level)); }
-  if (req.query.status){ sql += ' AND status=?'; args.push(req.query.status); }
+  if (level){ sql += ' AND level=?'; args.push(Number(level)); }
+  if (status){ sql += ' AND status=?'; args.push(status); }
   if (!isAdmin) sql += " AND status NOT IN ('draft','locked')";
   sql += ' ORDER BY created_at DESC';
-  const rows = await all(sql, args);
-  const missions = [];
-  for (const row of rows) missions.push(await missionWithClues(row.id, isAdmin));
-  res.json({ missions });
+  return attachClues(await all(sql, args), isAdmin);
+}
+async function readSharedValue(user, key){
+  const row = await get('SELECT value_json FROM records WHERE scope=? AND owner=? AND record_key=?', ['shared', '', key]);
+  if (!row) return null;
+  return filterSharedValue(user, key, JSON.parse(row.value_json));
+}
+app.get('/api/missions', auth, ah(async (req, res) => res.json({ missions: await listMissions(req.user, { level: req.query.level, status: req.query.status }) })));
+
+// Tudo que o site precisa a cada atualização, num pedido só (antes eram 6 ou 7, um depois do outro).
+app.get('/api/live/poll', auth, ah(async (req, res) => {
+  const user = req.user, isAdmin = user.role==='admin';
+  const level = req.query.level ? Number(req.query.level) : null;
+  const [snapshot, camp, round, activeMissions, sharedFeed, news, missions] = await Promise.all([
+    buildSnapshot(user), buildCampaign(user), buildRoundCurrent(user), listMissions(user, { status:'active' }),
+    buildSharedFeed(user), readSharedValue(user, 'karsk:news'),
+    (isAdmin && level) ? listMissions(user, { level }) : Promise.resolve(null)
+  ]);
+  res.json({ snapshot, campaign: camp.campaign, alerts: camp.alerts || [], round, activeMissions, sharedFeed: sharedFeed.files, news, missions });
 }));
 
 app.post('/api/missions', auth, admin, ah(async (req, res) => {
@@ -825,16 +896,17 @@ app.delete('/api/missions/clues/:id', auth, admin, ah(async (req, res) => {
 }));
 
 /* ---- Estado da campanha ---- */
-app.get('/api/campaign', auth, ah(async (req, res) => {
-  const isAdmin = req.user.role==='admin';
-  const c = await getCampaign();
+async function buildCampaign(user){
+  const isAdmin = user.role==='admin';
+  const [c, alertRows] = await Promise.all([
+    getCampaign(),
+    isAdmin ? all("SELECT a.id, a.mission_id, a.reason, a.created_at, m.title FROM emergency_alerts a LEFT JOIN missions m ON m.id=a.mission_id WHERE a.status='pending' ORDER BY a.created_at") : Promise.resolve([])
+  ]);
   const out = { campaign: publicCampaign(c, isAdmin) };
-  if (isAdmin){
-    const rows = await all("SELECT a.id, a.mission_id, a.reason, a.created_at, m.title FROM emergency_alerts a LEFT JOIN missions m ON m.id=a.mission_id WHERE a.status='pending' ORDER BY a.created_at");
-    out.alerts = rows.map(a => ({ id:a.id, missionId:a.mission_id, missionTitle:a.title, reason:a.reason, createdAt:a.created_at }));
-  }
-  res.json(out);
-}));
+  if (isAdmin) out.alerts = alertRows.map(a => ({ id:a.id, missionId:a.mission_id, missionTitle:a.title, reason:a.reason, createdAt:a.created_at }));
+  return out;
+}
+app.get('/api/campaign', auth, ah(async (req, res) => res.json(await buildCampaign(req.user))));
 
 app.put('/api/campaign', auth, admin, ah(async (req, res) => {
   const c = await getCampaign(); const b = req.body || {}; const notes = [];
@@ -927,22 +999,24 @@ app.post('/api/campaign/alerts/:id/dismiss', auth, admin, ah(async (req, res) =>
   res.json({ ok: true });
 }));
 
-app.get('/api/missions/rounds/current', auth, ah(async (req, res) => {
+async function buildRoundCurrent(user){
   const round = await get('SELECT * FROM vote_rounds ORDER BY round DESC LIMIT 1');
-  if (!round) return res.json({ round: null, missions: [], tally: {}, myVote: null, voters: null });
-  const isAdmin = req.user.role==='admin';
+  if (!round) return { round: null, missions: [], tally: {}, myVote: null, voters: null };
+  const isAdmin = user.role==='admin';
   const missionIds = JSON.parse(round.mission_ids_json||'[]');
-  const missions = [];
-  for (const mid of missionIds){ const m = await missionWithClues(mid, isAdmin); if (m) missions.push(m); }
-  const voteRows = await all('SELECT mission_id, COUNT(*) as n FROM mission_ballots WHERE round=? GROUP BY mission_id', [round.round]);
+  const [missions, voteRows, myVoteRow, voters] = await Promise.all([
+    missionsByIds(missionIds, isAdmin),
+    all('SELECT mission_id, COUNT(*) as n FROM mission_ballots WHERE round=? GROUP BY mission_id', [round.round]),
+    get('SELECT mission_id FROM mission_ballots WHERE round=? AND username=?', [round.round, user.username]),
+    isAdmin ? all('SELECT username, mission_id FROM mission_ballots WHERE round=?', [round.round]) : Promise.resolve(null)
+  ]);
   const tally = {}; voteRows.forEach(v => { tally[v.mission_id] = v.n; });
-  const myVoteRow = await get('SELECT mission_id FROM mission_ballots WHERE round=? AND username=?', [round.round, req.user.username]);
-  const voters = isAdmin ? await all('SELECT username, mission_id FROM mission_ballots WHERE round=?', [round.round]) : null;
-  res.json({
+  return {
     round: { number: round.round, status: round.status, openedBy: round.opened_by, openedAt: round.opened_at, closedAt: round.closed_at, winnerMissionId: round.winner_mission_id },
     missions, tally, myVote: myVoteRow ? myVoteRow.mission_id : null, voters
-  });
-}));
+  };
+}
+app.get('/api/missions/rounds/current', auth, ah(async (req, res) => res.json(await buildRoundCurrent(req.user))));
 app.post('/api/missions/rounds', auth, admin, ah(async (req, res) => {
   const existing = await get("SELECT round FROM vote_rounds WHERE status='voting'");
   if (existing) return res.status(409).json({ error: 'ROUND_ALREADY_OPEN', round: existing.round });
@@ -1018,10 +1092,11 @@ function canSeeFile(requester, row){
   if (requester.role === 'admin') return row.classification !== 'PESSOAL';
   return row.classification === 'COMPARTILHADO' && !!row.shared_with_agents;
 }
-app.get('/api/files/shared-feed', auth, ah(async (req, res) => {
-  const rows = await all("SELECT * FROM agent_files WHERE classification='COMPARTILHADO' AND shared_with_agents=1 AND owner!=? ORDER BY updated_at DESC LIMIT 100", [req.user.username]);
-  res.json({ files: rows.map(publicAgentFile) });
-}));
+async function buildSharedFeed(user){
+  const rows = await all("SELECT * FROM agent_files WHERE classification='COMPARTILHADO' AND shared_with_agents=1 AND owner!=? ORDER BY updated_at DESC LIMIT 100", [user.username]);
+  return { files: rows.map(publicAgentFile) };
+}
+app.get('/api/files/shared-feed', auth, ah(async (req, res) => res.json(await buildSharedFeed(req.user))));
 app.get('/api/files', auth, ah(async (req, res) => {
   const owner = String(req.query.owner || req.user.username).toLowerCase();
   const rows = await all('SELECT * FROM agent_files WHERE owner=? ORDER BY updated_at DESC', [owner]);

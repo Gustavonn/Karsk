@@ -1716,6 +1716,7 @@ async function loadLastSession(){
   if (!raw) return null;
   try{ return JSON.parse(raw); }catch(e){ return null; }
 }
+let lastSessionSig = '';
 async function saveLastSession(){
   if (!STATE.agentId) return;
   const data = {
@@ -1724,6 +1725,9 @@ async function saveLastSession(){
     audio: AUDIO_SETTINGS, map3d: map3d ? {yaw:map3d.yaw,pitch:map3d.pitch,distance:map3d.distance,target:{x:map3d.target.x,y:map3d.target.y,z:map3d.target.z}} : null,
     savedAt: Date.now()
   };
+  const sig = sessionStoreKey()+'|'+JSON.stringify(Object.assign({}, data, { savedAt: 0 }));
+  if (sig === lastSessionSig) return; // nada mudou desde o último salvamento
+  lastSessionSig = sig;
   await Store.set(sessionStoreKey(), JSON.stringify(data), false);
 }
 let sessionSaveHandle = null;
@@ -1792,18 +1796,18 @@ function updateLiveBadge(){
 }
 function clearUnreadLive(){ UNREAD_LIVE_IDS.clear(); persistUnreadLiveIds(); updateLiveBadge(); }
 let SHARED_FILES_SEEN = new Set();
-async function pollSharedFilesFeed(){
+async function pollSharedFilesFeed(batch){
   if (!ONLINE_API_BASE) return [];
   try{
-    const r = await onlineRequest('/files/shared-feed');
+    const r = batch ? { files: batch.sharedFeed } : await onlineRequest('/files/shared-feed');
     const items = r.files || [];
     const fresh = [];
     items.forEach(f=>{ const key='file:'+f.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); fresh.push({kind:'file', item:f}); } });
     return fresh;
   }catch(e){ return []; }
 }
-async function pollNewsUpdates(){
-  const raw = await Store.get(NEWS_STORE_KEY, true);
+async function pollNewsUpdates(batch){
+  const raw = (batch && batch.news!==undefined) ? batch.news : await Store.get(NEWS_STORE_KEY, true);
   if (!raw) return [];
   let serverItems;
   try{ serverItems = JSON.parse(raw); if (!Array.isArray(serverItems)) return []; }catch(e){ return []; }
@@ -1818,11 +1822,11 @@ async function pollNewsUpdates(){
   if (typeof renderNewsPanel === 'function') renderNewsPanel();
   return fresh;
 }
-async function pollMissionUpdates(){
+async function pollMissionUpdates(batch){
   if (!ONLINE_API_BASE) return [];
-  await refreshCampaign();
-  await refreshMissionRound();
-  await refreshMissionList();
+  await refreshCampaign(batch);
+  await refreshMissionRound(batch);
+  await refreshMissionList(batch);
   const round = LIVE_STATE.missionRound;
   const fresh = [];
   if (round){
@@ -1848,17 +1852,56 @@ async function pollMissionUpdates(){
   }
   return fresh;
 }
-async function refreshLive(){
-  if (ONLINE_API_BASE){ try{ const data=await onlineRequest('/live/snapshot'); Object.assign(LIVE_STATE,{presence:data.presence||[],events:data.events||[],transmissions:data.transmissions||[],states:data.states||[]}); LIVE_STATE.activeState=LIVE_STATE.states.find(state=>state.active)||LIVE_STATE.states[0]||null; }catch(e){} }
+const LIVE_POLL_VISIBLE_MS = 10000, LIVE_POLL_HIDDEN_MS = 30000;
+let liveRefreshPromise = null, liveRefreshQueued = false, liveVisibilityBound = false, liveSseTimer = null;
+let lastLiveRenderSig = '', lastMarkersSig = '';
+// Tudo que o site precisa a cada atualização vem num pedido só. Se o servidor for antigo (sem /live/poll) ou der erro, cai no modo antigo.
+async function fetchLiveBatch(){
+  if (!ONLINE_API_BASE) return null;
+  try{ return await onlineRequest('/live/poll'+((STATE.role==='admin' && LIVE_STATE.missionLevel) ? ('?level='+LIVE_STATE.missionLevel) : '')); }
+  catch(e){ return null; }
+}
+function liveStateSig(){
+  return JSON.stringify([LIVE_STATE.activeTab, STATE.role, LIVE_STATE.presence.map(p=>{ const q=Object.assign({},p); delete q.lastSeen; return q; }), LIVE_STATE.events, LIVE_STATE.transmissions, LIVE_STATE.states,
+    LIVE_STATE.campaign, LIVE_STATE.alerts, LIVE_STATE.missionRound, LIVE_STATE.roundMissions, LIVE_STATE.missionTally, LIVE_STATE.myMissionVote,
+    LIVE_STATE.missionVoters, LIVE_STATE.missions, LIVE_STATE.activeMissions, LIVE_STATE.missionLevel, Array.from(LIVE_STATE.missionSelection)]);
+}
+// Nunca roda dois ciclos ao mesmo tempo: se chegar outro pedido no meio, ele entra na fila e roda UMA vez no fim.
+function refreshLive(){
+  if (liveRefreshPromise){ liveRefreshQueued = true; return liveRefreshPromise; }
+  const guard = new Promise(resolve=>setTimeout(resolve, 20000)); // rede travada não pode bloquear as próximas atualizações
+  liveRefreshPromise = Promise.race([refreshLiveOnce(), guard]).catch(()=>{}).then(()=>{
+    liveRefreshPromise = null;
+    if (liveRefreshQueued){ liveRefreshQueued = false; setTimeout(refreshLive, 300); }
+  });
+  return liveRefreshPromise;
+}
+function scheduleLivePoll(){
+  clearTimeout(LIVE_STATE.pollHandle);
+  LIVE_STATE.pollHandle = setTimeout(async ()=>{ await refreshLive(); scheduleLivePoll(); }, document.hidden ? LIVE_POLL_HIDDEN_MS : LIVE_POLL_VISIBLE_MS);
+}
+function bindLiveVisibility(){
+  if (liveVisibilityBound) return; liveVisibilityBound = true;
+  document.addEventListener('visibilitychange', ()=>{ if (!document.hidden) refreshLive(); scheduleLivePoll(); });
+}
+async function refreshLiveOnce(){
+  let batch = null;
+  if (ONLINE_API_BASE){ try{ batch = await fetchLiveBatch(); const data = batch ? batch.snapshot : await onlineRequest('/live/snapshot'); Object.assign(LIVE_STATE,{presence:data.presence||[],events:data.events||[],transmissions:data.transmissions||[],states:data.states||[]}); LIVE_STATE.activeState=LIVE_STATE.states.find(state=>state.active)||LIVE_STATE.states[0]||null; }catch(e){} }
   else await loadLiveLocal();
   await ensureSeenLiveLoaded();
   const freshlyNew = [];
   LIVE_STATE.events.forEach(event=>{ const key='evt:'+event.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'event', item:event}); } });
   LIVE_STATE.transmissions.forEach(tx=>{ const key='tx:'+tx.id; if (!SEEN_LIVE_IDS.has(key)){ SEEN_LIVE_IDS.add(key); freshlyNew.push({kind:'transmission', item:tx}); } });
-  freshlyNew.push(...await pollSharedFilesFeed());
-  freshlyNew.push(...await pollNewsUpdates());
-  freshlyNew.push(...await pollMissionUpdates());
-  renderLivePanel(); renderMarkers(); updateLiveHud();
+  freshlyNew.push(...await pollSharedFilesFeed(batch));
+  freshlyNew.push(...await pollNewsUpdates(batch));
+  freshlyNew.push(...await pollMissionUpdates(batch));
+  // só redesenha o que realmente mudou (antes: painel + TODOS os marcadores recriados a cada 5 segundos, mesmo sem novidade)
+  const panelOpen = document.getElementById('live-panel').classList.contains('open');
+  if (panelOpen){ const sig = liveStateSig(); if (sig !== lastLiveRenderSig){ lastLiveRenderSig = sig; renderLivePanel(); } }
+  else lastLiveRenderSig = '';
+  const markersSig = JSON.stringify(LIVE_STATE.presence.filter(a=>a.online).map(a=>[a.userId||a.agentId, a.displayName, a.status, a.locationId, a.districtId, a.regionId, a.visibleToAgents]));
+  if (markersSig !== lastMarkersSig){ lastMarkersSig = markersSig; renderMarkers(); }
+  updateLiveHud();
   if (freshlyNew.length){
     persistSeenLiveIds();
     freshlyNew.forEach(entry=> UNREAD_LIVE_IDS.add(entry.kind+':'+(entry.item.id||entry.item.title)));
@@ -1939,8 +1982,9 @@ const CONS_FIELDS=[['chaos','Caos'],['crime','Crim.'],['anomalies','Anom.'],['co
 const CAMPAIGN_LOG_ICON={vote:'🗳',ignored:'⚠',resolve:'✅',advance:'▶',emergency:'🚨',trigger:'🔔',manual:'✏'};
 
 /* ---------- carregamento de dados ---------- */
-async function refreshMissionList(){
+async function refreshMissionList(batch){
   if (!ONLINE_API_BASE || STATE.role!=='admin') return;
+  if (batch && batch.missions){ LIVE_STATE.missions = batch.missions; return; }
   try{ const data = await onlineRequest('/missions?level='+LIVE_STATE.missionLevel); LIVE_STATE.missions = data.missions||[]; }
   catch(e){ LIVE_STATE.missions = []; }
 }
@@ -1954,27 +1998,27 @@ function applyCampaignChaosToHud(){
   if (chaosValueEl) chaosValueEl.textContent = Math.round(STATE.chaos)+'%';
   if (chaosFillEl){ chaosFillEl.style.width = STATE.chaos+'%'; chaosFillEl.style.background = STATE.chaos>65 ? 'var(--danger)' : (STATE.chaos>38 ? 'var(--phosphor)' : 'var(--brass-bright)'); }
 }
-async function refreshCampaign(){
+async function refreshCampaign(batch){
   if (!ONLINE_API_BASE) return;
   try{
-    const data = await onlineRequest('/campaign');
+    const data = batch ? { campaign: batch.campaign, alerts: batch.alerts } : await onlineRequest('/campaign');
     LIVE_STATE.campaign = data.campaign;
     LIVE_STATE.alerts = data.alerts || [];
     if (!LIVE_STATE.levelInitialized){ LIVE_STATE.missionLevel = data.campaign.level; LIVE_STATE.levelInitialized = true; }
     applyCampaignChaosToHud();
   }catch(e){}
 }
-async function refreshMissionRound(){
+async function refreshMissionRound(batch){
   if (!ONLINE_API_BASE) return;
   try{
-    const data = await onlineRequest('/missions/rounds/current');
+    const data = batch ? batch.round : await onlineRequest('/missions/rounds/current');
     LIVE_STATE.missionRound = data.round;
     LIVE_STATE.roundMissions = data.missions || [];
     LIVE_STATE.missionTally = data.tally || {};
     LIVE_STATE.myMissionVote = data.myVote || null;
     LIVE_STATE.missionVoters = data.voters || null;
   }catch(e){}
-  try{ LIVE_STATE.activeMissions = (await onlineRequest('/missions?status=active')).missions || []; }
+  try{ LIVE_STATE.activeMissions = batch ? (batch.activeMissions || []) : ((await onlineRequest('/missions?status=active')).missions || []); }
   catch(e){ LIVE_STATE.activeMissions = []; }
 }
 
@@ -2426,12 +2470,12 @@ async function updateAgentPresence(entity, online){
   else { const index=LIVE_STATE.presence.findIndex(item=>item.agentId===STATE.agentId); const row=Object.assign({agentId:STATE.agentId,userId:STATE.agentId,lastSeen:Date.now()},presence); if(index<0)LIVE_STATE.presence.push(row);else LIVE_STATE.presence[index]=row; await saveLiveLocal('presence'); }
   refreshLive();
 }
-function openLivePanel(){ document.getElementById('live-panel').classList.add('open'); refreshLive().then(clearUnreadLive); playAudio('panel'); }
+function openLivePanel(){ document.getElementById('live-panel').classList.add('open'); renderLivePanel(); refreshLive().then(clearUnreadLive); playAudio('panel'); }
 function closeLivePanel(){ document.getElementById('live-panel').classList.remove('open'); playAudio('close'); }
 function startLiveSync(){
-  refreshLive(); clearInterval(LIVE_STATE.pollHandle); clearInterval(LIVE_STATE.presenceHandle); LIVE_STATE.pollHandle=setInterval(refreshLive,5000);
+  refreshLive(); clearTimeout(LIVE_STATE.pollHandle); clearInterval(LIVE_STATE.presenceHandle); scheduleLivePoll(); bindLiveVisibility();
   LIVE_STATE.presenceHandle=setInterval(()=>{ const entity=STATE.selectedId?ENTITIES[STATE.selectedId]:null; updateAgentPresence(entity,true); },45000);
-  if (ONLINE_API_BASE && typeof EventSource!=='undefined'){ LIVE_STATE.eventSource=new EventSource(ONLINE_API_BASE+'/live/stream', {withCredentials:true}); LIVE_STATE.eventSource.onmessage=()=>refreshLive(); }
+  if (ONLINE_API_BASE && typeof EventSource!=='undefined'){ LIVE_STATE.eventSource=new EventSource(ONLINE_API_BASE+'/live/stream', {withCredentials:true}); LIVE_STATE.eventSource.onmessage=()=>{ clearTimeout(liveSseTimer); liveSseTimer=setTimeout(refreshLive, 400); }; }
 }
 
 function canUserViewNews(item){
@@ -3027,6 +3071,7 @@ function renderMarkers(){
     const tag=document.createElement('div'); tag.className='marker-tag'; tag.textContent=(agent.displayName||agent.agentId||agent.userId)+' · '+(agent.status||'ONLINE'); el.appendChild(tag);
     el.addEventListener('click',()=>{ LIVE_STATE.activeTab='agents'; openLivePanel(); }); markerContainerEl.appendChild(el);
   });
+  updateVisibility(true); // marcadores novos nascem com a visibilidade certa (sem piscar)
 }
 
 /* ============================================================================
@@ -3223,7 +3268,7 @@ function renderAll(){
   renderMarkers();
   renderBuildings();
   renderUrbanAreas();
-  updateVisibility();
+  updateVisibility(true);
   renderBreadcrumbs();
 }
 
@@ -3495,8 +3540,11 @@ function prepareOnlineBackend(endpoint){
 /* ============================================================================
    VISIBILITY / PROGRESSIVE REVEAL
    ============================================================================ */
-function updateVisibility(){
+let visibilityDirty = true, lastVisibilityZoom = -1;
+function updateVisibility(force){
   const zoom = STATE.camera.zoom;
+  if (!force && !visibilityDirty && Math.abs(zoom - lastVisibilityZoom) < 0.002) return; // só arrastando: nada a recalcular
+  visibilityDirty = false; lastVisibilityZoom = zoom;
 
   // district shapes + labels fade in past zoom 1.05
   const distOpacity = zoom > 1.05 ? 1 : Math.max(0, (zoom-0.85)/0.2);
@@ -3545,7 +3593,14 @@ function worldCoordCode(x,y){
   return 'KSK-'+city+'-'+String(Math.round(x)).padStart(2,'0')+String(Math.round(y)).padStart(2,'0');
 }
 
-function updateCoordReadout(){
+let coordLastPaint = 0, coordPaintTimer = null;
+function updateCoordReadout(){ // no máximo ~8 vezes por segundo (antes: a cada quadro)
+  if (!coordReadoutEl) return;
+  const now = performance.now();
+  if (now - coordLastPaint >= 120){ coordLastPaint = now; paintCoordReadout(); }
+  else if (!coordPaintTimer){ coordPaintTimer = setTimeout(()=>{ coordPaintTimer = null; coordLastPaint = performance.now(); paintCoordReadout(); }, 120); }
+}
+function paintCoordReadout(){
   if (!coordReadoutEl) return;
   coordReadoutEl.innerHTML =
     'CAMERA X '+STATE.camera.x.toFixed(1)+' · Y '+STATE.camera.y.toFixed(1)+'<br>'+
@@ -3640,6 +3695,7 @@ function showTargetLock(show, name){
 function discover(id){
   if (STATE.discovered.has(id)) return false;
   STATE.discovered.add(id);
+  visibilityDirty = true;
   playAudio('discovery');
   saveDiscoveries();
   return true;
@@ -3691,7 +3747,7 @@ function focusOnEntity(entity, opts){
       if (entity.kind==='custom-region' && opts.autoReveal3d !== false){
         openMap3d(entity);
       }
-      updateVisibility();
+      updateVisibility(true);
       if (startZoom > 3 && entity.kind !== 'city'){
         STATE.camera.zoom = Math.min(CAM_MAX_ZOOM, STATE.camera.zoom + 0.15);
         applyCameraTransform();
@@ -5825,7 +5881,7 @@ async function logout(){
   playAudio('logout');
   await saveLastSession();
   await updateAgentPresence(null, false);
-  clearInterval(LIVE_STATE.presenceHandle); clearInterval(LIVE_STATE.pollHandle); if (LIVE_STATE.eventSource) { LIVE_STATE.eventSource.close(); LIVE_STATE.eventSource=null; }
+  clearInterval(LIVE_STATE.presenceHandle); clearInterval(LIVE_STATE.pollHandle); clearTimeout(LIVE_STATE.pollHandle); clearTimeout(liveSseTimer); if (LIVE_STATE.eventSource) { LIVE_STATE.eventSource.close(); LIVE_STATE.eventSource=null; }
   if (ONLINE_API_BASE && ONLINE_TOKEN) await onlineRequest('/auth/logout', {method:'POST'}).catch(()=>{});
   ONLINE_TOKEN = '';
   if (worldTickHandle){ clearInterval(worldTickHandle); worldTickHandle=null; }
